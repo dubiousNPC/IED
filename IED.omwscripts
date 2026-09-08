@@ -1,0 +1,30 @@
+# Inventory Equipment Display
+#
+# AnimRefresh is bundled and version-guards itself, so if another mod ships a
+# newer copy only that one runs. It is PLAYER-only: perspective changes rebuild
+# the player's animation object and drop attached VFX, which NPCs are not
+# affected by.
+PLAYER: scripts/AnimRefresh/AnimRefresh_v2.lua
+
+# SuperSelect3 renders the "Base slots" dropdown. Bundled rather than copied
+# into settings.lua, the same way AnimRefresh is. It MUST load before
+# settings.lua: it advertises itself by writing to the
+# InstalledSettingsRenderers storage section as it loads, and settings.lua
+# reads that flag at registration time to choose between this renderer and the
+# engine's built-in `select`. Entries in one .omwscripts run in written order,
+# so this ordering is load-bearing.
+#
+# If SuperSettingsRenderers is also installed standalone, delete the line below
+# and the scripts/SuperSettingsRenderers folder; the standalone copy provides
+# the same renderer and IED will find it.
+MENU:   scripts/SuperSettingsRenderers/SuperSelect3.lua
+
+# Settings. The MENU script declares them, the GLOBAL script owns a storage
+# section local scripts can read, and player.lua relays between the two -- an
+# NPC local script cannot read a player settings section, so the detour is
+# required rather than decorative.
+MENU:   scripts/show-all-weapons/settings.lua
+GLOBAL: scripts/show-all-weapons/global.lua
+
+PLAYER: scripts/show-all-weapons/player.lua
+NPC:    scripts/show-all-weapons/npc.lua
