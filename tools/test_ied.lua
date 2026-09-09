@@ -248,5 +248,51 @@ check('an engine-sheathed weapon blocks only the standard slot',
       and world.vfx['Bip01 LongBladeOneHandSem']~=nil
       and (world.doubled or 0)==0)
 
+print('perspective switch (the reported bug)')
+-- Reproduce it exactly: subscribe through the real interface, then fire the
+-- callback while the skeleton reports no bones -- as it does for a moment after
+-- the animation object is rebuilt.
+local subs = {}
+package.loaded['openmw.interfaces'] = nil
+package.preload['openmw.interfaces'] = function() return {
+    AnimRefresh = { subscribe = function(k,cb) subs[k]=cb end,
+                    unsubscribe = function(k) subs[k]=nil end },
+} end
+local common2 = dofile(DIR..'common.lua')
+
+inv={mk('sword_a',W.LongBladeOneHand)}
+world.equip={}; world.stance=0; world.vfx={}
+setCfg{}
+for b in pairs({['Bip01 LongBladeOneHand']=1,['Bip01 AttachShield']=1}) do world.bones[b]=true end
+
+local update = common2.makeUpdateHandler({}, true)
+check('IED subscribes to AnimRefresh', subs['InventoryEquipmentDisplay']~=nil)
+
+update(99)                       -- first pass builds
+check('gear shows normally', world.vfx['Bip01 LongBladeOneHand']~=nil)
+
+-- the skeleton is mid-rebuild: every bone reports missing
+local saved = {}
+for k,v in pairs(world.bones) do saved[k]=v end
+world.bones={}
+world.vfx={}
+local answer = subs['InventoryEquipmentDisplay']()
+check('a rebuild into a half-built skeleton attaches nothing',
+      next(world.vfx)==nil)
+check('and it tells AnimRefresh to ask again',
+      answer==false,
+      'returning nil here is what lost the gear until the next stance change')
+
+-- skeleton finishes rebuilding; AnimRefresh retries
+world.bones = saved
+local answer2 = subs['InventoryEquipmentDisplay']()
+check('the retry restores the gear', world.vfx['Bip01 LongBladeOneHand']~=nil)
+check('and reports ready', answer2 ~= false)
+
+-- and a normal refresh with nothing to draw is NOT a false not-ready
+inv={}; world.vfx={}
+check('empty inventory reports ready, not a retry loop',
+      subs['InventoryEquipmentDisplay']() ~= false)
+
 print(fails==0 and 'ALL PASS' or (fails..' FAILURES'))
 if fails>0 then os.exit(1) end

@@ -1,132 +1,191 @@
-# IED v0.60
-
-Inventory Equipment Display — carried weapons, shields and ammunition shown on
-the body, using the same sheath bones as OpenMW's own weapon sheathing.
+# IED v0.61
 
 ---
 
-## What changed in this version
+## The bug: gear vanishes on 1st → 3rd and only returns when you draw
 
-Every Lua file under `scripts/show-all-weapons/` is **byte-identical** to the
-previous build. The changes are all assets, packaging and documentation.
+Two independent faults, both in `common.lua`. Neither is in `AnimRefresh_v2`,
+which is correct as written.
+
+### 1. IED bundles AnimRefresh v2 and does not use its protocol
+
+v2's whole reason for existing is a readiness handshake. From its own header:
+
+> A subscriber that returns exactly `false` is saying "the model was not ready,
+> ask me again". This service cannot apply that guard itself — it has no idea
+> which bone a subscriber cares about. So the test is inverted: the subscriber,
+> which does know, reports readiness by return value and this schedules the
+> retry.
+
+IED's subscriber was:
+
+```lua
+I.AnimRefresh.subscribe("InventoryEquipmentDisplay", function()
+    forceRebuild = true
+end)
+```
+
+It sets a flag and returns `nil`. `nil` means **delivered**. So:
+
+1. POV pressed → AnimRefresh waits `SETTLE_DELAY` (0.10 s) → fires.
+2. IED sets `forceRebuild` and returns nil. AnimRefresh counts it delivered and
+   **never retries**.
+3. On the next `onUpdate`, IED rebuilds. If the animation object is still being
+   replaced, every `anim.hasBone` answers false, no candidate bone is `usable`,
+   and nothing attaches — **silently**.
+4. `rebuildNow` sets `forceRebuild = false` regardless. The failed attempt is
+   final.
+5. Nothing changes until the *signature* changes — which is what drawing a
+   weapon does, via `isDrawn`.
+
+That is the reported symptom, exactly.
+
+**Fix:** the subscriber now rebuilds *in the callback* and returns the answer.
+`handler` reports whether it wanted a bone and found none; `rebuildNow`
+propagates it; returning `false` makes AnimRefresh retry once on a 0.1 s timer.
+
+Deferring the work to the next tick threw the answer away. **A mod that bundles
+a service should use the contract it ships.**
+
+### 2. Two signature builders that could never agree
+
+`rebuildNow` stored a signature built from inventory and stance alone.
+The poll compared against one with the settings suffix appended:
+
+```lua
+.. tostring(cfgCache.showWeapons) .. tostring(cfgCache.showShields) ...
+```
+
+Different strings by construction, so every forced rebuild was followed by a
+redundant one on the very next tick. Not the reported bug, but it doubled the
+cost of the exact event this mod is most sensitive to.
+
+**Fix:** one `currentSignature()` used by both paths. Two builders for one value
+is a bug waiting for someone to edit one of them.
+
+---
+
+## Performance: the allocation point, applied
+
+`The problem described.txt` makes a specific, checkable claim:
+
+> Assume every field index on a userdata that returns something other than a
+> function allocates — because it does. Cache your usertypes wherever possible.
+
+IED was calling `types.Actor.inventory(actor)` **twice per cycle** — once in
+`buildSignature`, once again inside `handler` — for a handle that is stable and
+updates itself. On every poll, on every NPC in the cell.
+
+RESEARCH §1.10 already says exactly this:
+
+> `types.Actor.inventory(self)` — the handle is stable and self-updating; hoist
+> it to script init rather than re-resolving.
+
+Now resolved once in `makeUpdateHandler` and passed down. Three call sites
+remain, all `inv or types.Actor.inventory(actor)` fallbacks for direct callers.
+
+The rest of the hot path was already right, and worth not regressing: the
+"nothing changed" path is a string compare against a cached signature, and
+`buildSignature` deliberately reads `item.recordId` and `item.count` off the
+object rather than doing a record lookup.
+
+---
+
+## Is H3lp Yours3lf viable as a dependency?
+
+**Not as shipped, and the reason is packaging rather than design.**
+
+The archive contains **no top-level `.omwscripts`**. The only manifest is
+`examples/h3-fixtures.omwscripts`, which the documentation explicitly says is
+opt-in probe scripts and *not* normal behaviour. `scripts/s3/lf.lua` ends with
+
+```lua
+interfaceName = 's3',
+interface = { lf = instance },
+```
+
+so it must be registered as a PLAYER/LOCAL script for `I.s3.lf` to exist — and
+nothing in the download registers it. Any mod depending on `I.s3.lf` would find
+it nil. That is worth reporting upstream; it is not an argument about the design.
+
+On the design itself, for **this** mod specifically:
 
 | | |
 |---|---|
-| `animations/*/semaroBones.nif` | **Rewritten — see below.** All four folders, consistent with each other. |
-| `animations/*/dubiousBones.nif` | **Removed** (4 files). Correct: it carried the DBS/CAKE bones and two Smokebones, none of which IED names. |
-| `scripts/SuperSettingsRenderers/SuperSelect3.lua` | `---@omw-context menu` added. |
-| `LICENSE`, `README.md`, `.gitignore`, `.gitattributes` | Added. |
-| `tools/nifnodes.py` | Added. |
+| What s3lf solves | repeated userdata indexing, and `self.type.stats.dynamic.health(self)` ergonomics |
+| What IED's hot path actually does | one cached string compare; a rebuild only on change |
+| Overlap | small |
 
-### The skeleton rewrite is the substantive change, and it is a fix
+IED's per-poll cost after the hoist above is `getEquipment`, `getStance`, and two
+`getAll` walks. `s3lf` would flatten the first two into cached fields, which is a
+real but modest saving on a 0.5 s timer — and it would come at the cost of a hard
+dependency on a mod that currently cannot register itself, in a mod whose whole
+selling point is that it drops into an existing load order.
 
-`semaroBones.nif` previously contained the **12 standard sheath bones** and
-**none of the `...Sem` ones**. `bones.lua` has named the Sem bones since the
-Base slots feature landed, so:
+**Recommendation: no dependency. Steal the idea instead.** The finding worth
+taking is the one in `The problem described.txt`, and it cost two lines to apply.
+If H3 ships a working manifest and a version-guarded interface, `ProtectedTable`
+is the piece worth revisiting — it would replace the MENU → PLAYER → GLOBAL →
+NPC settings relay in `global.lua` with one construct. That relay is the ugliest
+part of this mod.
 
-> **Alternative and Combined modes could never have worked in the shipped
-> package.** Every Sem bone failed `hasBone`, so every weapon fell back to the
-> standard slot, and the two non-default modes were silently identical to
-> Standard.
-
-This version replaces those 12 nodes with the 12 `...Sem` variants. Alternative
-and Combined now have bones to attach to. All four skeletons (`xbase_anim`,
-`.1st`, `_female`, `_animkna`) carry the same 47-node set, so the behaviour is
-consistent across sexes and beast races.
-
----
-
-## Two things to decide before release
-
-### 1. `Bip01 SpearTwoWideSem` does not exist
-
-`bones.lua:86` maps `SpearTwoWide` to it. Eleven of the twelve weapon types got
-a Sem bone; spears did not. The consequence is not a crash — the candidate list
-falls back to `Bip01 SpearTwoWide` — but under **Combined**, spears are the one
-weapon type that gets no second slot, silently and for no stated reason.
-
-Either add the node to all four skeletons, or drop the `SpearTwoWide` row from
-`SEM_OVERRIDE` so the intent is explicit in code rather than implied by an
-absent node.
-
-### 2. Standard mode no longer ships its own bones
-
-The 12 standard bones (`Bip01 LongBladeOneHand`, `Bip01 AttachShield`, …) were
-removed along with the rename. Both the old and new files carry the embedded
-source name `xbase_anim_sh.nif`, so those bones come from OpenMW's weapon
-sheathing resource — which the previous package happened to bundle a copy of,
-and this one does not.
-
-For a user who already runs weapon sheathing, nothing changes. For one who does
-not, **Standard — the default — now has no bones to attach to**, and the failure
-is silent.
-
-Two clean options:
-
-- Restore the 12 standard nodes *alongside* the Sem ones, so the mod is
-  self-sufficient again (59 Bip01 nodes rather than 47); or
-- Declare weapon sheathing a hard requirement in the README, which is arguably
-  honest anyway given what the mod does.
-
-`tools/check_bones.py` was written for this and takes the engine-supplied names
-via `--external`, so the distinction stays explicit rather than tribal:
-
-```
-python3 tools/check_bones.py . --external "Bip01 Ammo,Bip01 AttachWeapon,\
-Bip01 AttachShield,Bip01 ShortBladeOneHand,Bip01 LongBladeOneHand,\
-Bip01 LongBladeTwoClose,Bip01 BluntOneHand,Bip01 BluntTwoClose,\
-Bip01 BluntTwoWide,Bip01 SpearTwoWide,Bip01 AxeTwoClose,Bip01 MarksmanBow,\
-Bip01 MarksmanCrossbow,Bip01 MarksmanThrown"
-```
+Two caveats if that day comes: `ProtectedTable` is documented as unavailable in
+MENU context, which is where IED's settings page lives; and it only works with
+**global** setting groups, not player ones.
 
 ---
 
-## Stale documentation
+## RESEARCH.md compared against these findings
 
-`ASSESSMENT.md` refers to `dubiousBones.nif` in three places, including the
-instructions for adding a new attachment point ("add the node to
-`dubiousBones.nif` (all four folders)"). That file is no longer shipped, so the
-instruction now points at nothing. Either restore the reference to
-`semaroBones.nif` or note that the DBS rig moved to CAKE.
+| Finding | RESEARCH says | Verdict |
+|---|---|---|
+| Re-resolving the inventory handle | §1.10 — hoist it | **Documented, and violated.** |
+| Missing bone is a silent no-show | §3.2 | Documented and honoured — `usable()` checks first |
+| Deferred refresh, `hasBone` guard, retry once | §1.8 | Documented as a *pattern*; the service implements it, the subscriber did not |
+| **A subscriber must report readiness or the retry cannot happen** | **absent** | **Gap.** The v2 contract lives only in v2's own header. |
+| **One value, one builder** | **absent** | **Gap.** Two signature builders is the same shape as §4.7's generated-file-fixed-by-hand. |
+
+Both gaps are worth adding. The first is the more valuable: a service can only
+honour a contract its subscribers implement, and the half that lives in the
+caller is the half nobody reads.
 
 ---
 
 ## Verification
 
-Everything below was run against this package. Cod3x 0.4.
+Cod3x 0.4.
 
 | Check | Result |
 |---|---|
-| `luacheck.py` — syntax | 8 files, **0 failures** |
-| `globalcheck.py` — undeclared globals | **0** |
-| `check_names.py` — undefined names, unused requires | **clean** |
-| `api_sweep.py` — every `module.member` vs Cod3x 0.4 | **nothing unrecognised** |
-| `ctxcheck.py` — `---@omw-context` vs the 0.4 policy | 8 files, **0 issues** |
-| `check_manifest.py` — one path, one flag set | **0 mismatches** |
-| l10n keys used vs defined | **0 missing, 0 unused** |
-| `pcall` in `scripts/show-all-weapons/` | **none** |
-| `tools/test_ied.lua` | **21/21 pass** |
-| `check_bones.py` | **1 finding** — `Bip01 SpearTwoWideSem` |
+| `luacheck.py` | 8 files, **0 failures** |
+| `check_load.py` — chunk executes | 7 files, **0 failures** |
+| `globalcheck.py` | **0** |
+| `check_names.py` | **clean** |
+| `api_sweep.py` vs Cod3x 0.4 | **nothing unrecognised** |
+| `ctxcheck.py` | **0 issues** |
+| `check_manifest.py` | **0 mismatches** |
+| `tools/test_ied.lua` | **27/27** |
 
-The one `pcall` in the package is `AnimRefresh_v2.lua`'s subscriber-callback
-isolation, which is the justified case (RESEARCH §2.3).
+Six tests are new and reproduce the reported bug directly:
 
-### Tools that were missing
+```
+IED subscribes to AnimRefresh
+gear shows normally
+a rebuild into a half-built skeleton attaches nothing
+and it tells AnimRefresh to ask again
+the retry restores the gear
+empty inventory reports ready, not a retry loop
+```
 
-`check_manifest.py`, `ctxcheck.py`, `globalcheck.py` and `sweep.py` were absent
-from `tools/`. They are the four that catch, respectively: a fatal load error, a
-context-annotation error, an undeclared global, and a dead setting. All four are
-now included, along with the new `check_bones.py`.
+That last one matters: an empty inventory must report **ready**, or the retry
+becomes a loop that fires on every perspective change for a player carrying
+nothing.
 
----
+### `check_load.py` needed three fixes to run here
 
-## Modes
-
-| Option | Bones | Slots per weapon type |
-|---|---|---|
-| **Standard** (default) | the original `_sh` sheathing slots | 1 |
-| **Alternative** | the `_Sem` slots from `semaroBones.nif` | 1 |
-| **Combined** | both layers, Standard filled first | 2 |
-
-Combined is player-only, adds no second shield and no second quiver, and falls
-back to Standard per bone where a Sem bone is absent. See `BASESLOTS.md`.
+`SuperSelect3.lua` exposed gaps in the stub: `scripts.omw.*` are engine-shipped
+scripts and must stub like `openmw.*`; chunk-level arithmetic on an engine
+constant needs `__add`/`__mul` and friends. The third could not be fixed —
+`("x"):gmatch(constant)` needs a real string and Lua will not coerce a table —
+so vendored files can now be excluded by name with `--skip`, rather than by
+loosening the stub until it stops catching real failures.

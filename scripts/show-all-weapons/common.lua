@@ -277,8 +277,8 @@ end
 --
 -- getAll ordering is not documented as stable; if it ever varies the signature
 -- differs and we do one redundant rebuild, which is harmless.
-local function buildSignature(actor, equippedWeaponId, equippedShieldId, isDrawn)
-    local inv = types.Actor.inventory(actor)
+local function buildSignature(actor, equippedWeaponId, equippedShieldId, isDrawn, inv)
+    inv = inv or types.Actor.inventory(actor)
     local parts = {
         equippedWeaponId or "-",
         equippedShieldId or "-",
@@ -297,9 +297,22 @@ end
 -- REBUILD
 -- ---------------------------------------------------------------------------
 
-local function handler(actor, equippedWeapon, equippedShield, isDrawn, isPlayer)
+---@return boolean ready false when something should have been drawn and the
+---skeleton had no bone for it -- see the AnimRefresh subscription below.
+local function handler(actor, equippedWeapon, equippedShield, isDrawn, isPlayer, inv)
     local mode = slotMode(isPlayer)
     clearVfx(actor)
+
+    -- Right after a perspective switch the animation object is still being
+    -- rebuilt, and hasBone answers false for bones that are about to exist. A
+    -- rebuild in that window attaches nothing, silently, and -- because
+    -- forceRebuild has already been cleared -- never tries again until the
+    -- inventory or stance changes. That is exactly the reported symptom: gear
+    -- vanishes on 1st -> 3rd and only returns when a weapon is drawn.
+    --
+    -- So the rebuild reports whether it found bones for what it meant to draw,
+    -- and the AnimRefresh subscription passes that answer back to the service.
+    local ready = true
 
     -- Attaching to a bone the skeleton lacks is a SILENT no-show, so every
     -- candidate is checked before it is taken. Memoized for this rebuild only:
@@ -314,7 +327,7 @@ local function handler(actor, equippedWeapon, equippedShield, isDrawn, isPlayer)
         return known
     end
 
-    local inv = types.Actor.inventory(actor)
+    inv = inv or types.Actor.inventory(actor)
     local equippedWeaponId = equippedWeapon and equippedWeapon.recordId or nil
     local equippedShieldId = equippedShield and equippedShield.recordId or nil
 
@@ -375,6 +388,12 @@ local function handler(actor, equippedWeapon, equippedShield, isDrawn, isPlayer)
                     end
                 end
 
+                if not bone and enabled('showWeapons') and rid ~= equippedWeaponId
+                   and not seen[rid] then
+                    -- Wanted a bone for this weapon and no candidate existed.
+                    ready = false
+                end
+
                 if bone then
                     -- One attachment per distinct record: the vfx tag is
                     -- derived from the record id, and two attachments sharing a
@@ -430,7 +449,10 @@ local function handler(actor, equippedWeapon, equippedShield, isDrawn, isPlayer)
     -- the fallback here too, so a skeleton without the Sem shield bone still
     -- shows the shield rather than nothing.
     local shieldBone = bones.shieldBone(mode)
-    if not usable(shieldBone) then shieldBone = bones.SHIELD_BONE end
+    if not usable(shieldBone) then
+        shieldBone = bones.SHIELD_BONE
+        if not usable(shieldBone) then ready = false end
+    end
     for _, item in ipairs(inv:getAll(types.Armor)) do
         if shieldsShown >= MAX_SHIELDS then break end
         local rid = item.recordId
@@ -445,6 +467,8 @@ local function handler(actor, equippedWeapon, equippedShield, isDrawn, isPlayer)
             end
         end
     end
+
+    return ready
 end
 
 -- ---------------------------------------------------------------------------
@@ -454,16 +478,41 @@ end
 ---@param actor any
 ---@param isPlayer boolean|nil true for the player script; NPC scripts pass nil
 function M.makeUpdateHandler(actor, isPlayer)
+    -- Resolved ONCE. The handle is stable and updates itself, and re-resolving
+    -- it allocated a fresh userdata on every poll and again inside every
+    -- rebuild -- twice per cycle, forever, for a value that never changes.
+    -- RESEARCH 1.10 says to hoist it; this is that.
+    local inv           = types.Actor.inventory(actor)
     local timer         = 0
     local lastSignature = nil
     local forceRebuild  = true   -- first pass always builds
 
-    local function rebuildNow()
+    -- One signature builder for both paths. rebuildNow used to store a
+    -- signature WITHOUT the settings suffix while the poll computed one WITH
+    -- it, so the two could never compare equal and every forced rebuild was
+    -- followed by a redundant one on the next tick.
+    local function currentSignature()
         local w, s, drawn = readState(actor)
-        lastSignature = buildSignature(actor,
-            w and w.recordId or nil, s and s.recordId or nil, drawn)
-        handler(actor, w, s, drawn, isPlayer)
+        return buildSignature(actor,
+            w and w.recordId or nil, s and s.recordId or nil, drawn, inv)
+            .. '|' .. tostring(cfgCache.showWeapons)
+            .. tostring(cfgCache.showShields)
+            .. tostring(cfgCache.showAmmo)
+            -- baseSlots belongs here too: switching to combined changes which
+            -- bones are used and how many attachments there are, but nothing
+            -- about the inventory, so without it the change would not be seen
+            -- until the player next picked something up.
+            .. tostring(cfgCache.baseSlots),
+            w, s, drawn
+    end
+
+    ---@return boolean ready
+    local function rebuildNow()
+        local signature, w, s, drawn = currentSignature()
+        lastSignature = signature
+        local ready = handler(actor, w, s, drawn, isPlayer, inv)
         forceRebuild = false
+        return ready
     end
 
     -- Perspective changes rebuild the player's animation object and drop
@@ -472,7 +521,18 @@ function M.makeUpdateHandler(actor, isPlayer)
     -- subscription simply does not happen there.
     if I.AnimRefresh and I.AnimRefresh.subscribe then
         I.AnimRefresh.subscribe("InventoryEquipmentDisplay", function()
-            forceRebuild = true
+            -- Rebuild HERE and report readiness, rather than setting a flag and
+            -- letting the next tick do it. AnimRefresh v2's contract is that a
+            -- subscriber returning exactly `false` means "the model was not
+            -- ready, ask me again", and the service then retries once on a
+            -- 0.1s timer. Deferring the work to the next onUpdate threw that
+            -- answer away: the service saw nil, counted it delivered, and the
+            -- rebuild that actually happened -- possibly into a half-built
+            -- skeleton -- had no way to ask for another go.
+            --
+            -- This mod bundles v2. It should use the protocol it ships.
+            local ready = rebuildNow()
+            if not ready then return false end
         end)
     end
 
@@ -505,23 +565,11 @@ function M.makeUpdateHandler(actor, isPlayer)
             return
         end
 
-        local w, s, drawn = readState(actor)
-        -- Settings join the signature, so toggling one rebuilds on the next
-        -- poll without needing its own change subscription in every context.
-        local signature = buildSignature(actor,
-            w and w.recordId or nil, s and s.recordId or nil, drawn)
-            .. '|' .. tostring(cfgCache.showWeapons)
-            .. tostring(cfgCache.showShields)
-            .. tostring(cfgCache.showAmmo)
-            -- baseSlots belongs here too: switching to combined changes which
-            -- bones are used and how many attachments there are, but nothing
-            -- about the inventory, so without it the change would not be seen
-            -- until the player next picked something up.
-            .. tostring(cfgCache.baseSlots)
+        local signature, w, s, drawn = currentSignature()
         if signature == lastSignature then return end
 
         lastSignature = signature
-        handler(actor, w, s, drawn, isPlayer)
+        handler(actor, w, s, drawn, isPlayer, inv)
     end
 end
 
