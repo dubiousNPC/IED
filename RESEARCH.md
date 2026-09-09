@@ -731,16 +731,24 @@ kept being the subscriber-callback isolation in `SharedRay` and `AnimRefresh`
 (§2.3). A third sweep, of HookShot, found **39 more, 27 removed, 12 kept** —
 every one of the 12 inside a vendored file (`beamfx_adapter.lua`,
 `SharedRay_v2.lua`) and therefore §2.3's first category wholesale, not a new
-justification. Running total: **71 found, 54 removed, 17 kept.** No sweep so far
-has found a *third* category worth keeping.
+justification. A fourth sweep, of IED, found **7 more, 6 removed, 1 kept** —
+again the subscriber-callback isolation. Running total: **78 found, 60 removed,
+18 kept.** No sweep so far has found a *third* category worth keeping.
+
+The IED sweep is worth one extra line because of what one of its removals was
+wrapping. The file's own header records that the original called
+`types.Actor.equipment`, **a function that does not exist**, and that the
+surrounding `pcall` hid it completely — the mod silently believed nothing was
+ever equipped. The argument against the pattern, written by the file about
+itself, sitting inside the `pcall` it was arguing against.
 
 The HookShot sweep is also the one where the removals were not a tidy-up: two of
 them had already caused a shipped bug each, and one was written *during* the
 debugging of the bug it went on to hide (§2.14).
 
-## 2.2 The two bugs it actually hid
+## 2.2 The bugs it actually hid
 
-Not hypothetical. Both cost real time.
+Not hypothetical. Each cost real time.
 
 **CAKE — a whole session.** `cake_shared.lua` baked the plugin's raw `MODL`
 string into the registry and handed it to `addVfx`:
@@ -1484,6 +1492,8 @@ play through `I.AnimationController`, check the pairing first.
 | **The engine occupies the same bones** | OpenMW's native weapon sheathing puts the equipped-and-undrawn weapon and shield on the same bones a display mod uses. Claim the bone only while `not isDrawn`; drawn, it is free again. |
 | **Excluding by record id, not occupancy** | Skipping "the equipped shield" by `recordId` still lets a *second, different* shield onto the bone the engine already filled. |
 | **Arbitration that never arbitrates** | OMWFW's five head categories each wrote their "bone owner" lock to a *different* storage section, so every `xIsOurs()` was unconditionally true. Distinct `vfxId`s mean shared-bone categories do not evict each other anyway — declare explicit `conflicts` both ways and assert symmetry. |
+| **A fallback probed per actor, not per bone** | IED asked "does this actor have the Sem rig" once, by probing one bone, and fell the whole actor back on a miss. A skeleton with *some* of the extra bones merged then showed nothing for the types it did have. Return the fallback as a later candidate and test each candidate against the actor's own skeleton; the granularity of the probe should match the granularity of the failure. |
+| **Layering two bone sets** | Where a mode stacks a second rig on a first (IED's `combined`), resolve to an **ordered candidate list** and take the first free, existing bone. One bone per type is then just a one-element list, and the "no second shield, no second quiver" rule falls out for free: a type with no override in the second rig yields one candidate under every mode. |
 
 ## 3.4 State
 
@@ -1504,6 +1514,7 @@ play through `I.AnimationController`, check the pairing first.
 | **Ids from a different content set** | 50 ids in a script, **none** of which existed in any shipped plugin. Always cross-check the registry against the plugin binary. |
 | **Undeclared masters** | Meshes from OAAB, Project Cyrodiil and others resolve fine for you and not for users. Declare the masters — do **not** "fix" it by editing or dropping the records; those paths are correct. |
 | **Bodypart / item id collisions** | Reusing bodypart ids (`_RV_Ashmask1_H`) for wearable items works at the engine level but conflates the two everywhere else. A prefix resolves it. |
+| **A plugin that ships none of the records the module needs** | `SD_Scarves.esp` was the CAKE item plugin renamed: 320 MISC records, **zero SPEL**. Every ability the module granted was guarded `if core.magic.spells.records[id] then` — which is correct, and which is exactly why the failure was invisible. Items equipped, meshes attached, and no bonus ever applied. A guard that makes absence survivable also makes it silent (§2.8); pair it with a one-line startup log of what resolved. |
 
 ## 3.6 Structure
 
@@ -1513,6 +1524,21 @@ play through `I.AnimationController`, check the pairing first.
   validates its keys against it. Prune empties at generation time.
 - **Registration must be idempotent.** `onInit` and `onLoad` both call it and
   only one runs on a given start.
+- **Register with the host's convention, and do not reassign the host's
+  tables.** Every Sun's Dusk module registers a settings hook with
+  `table.insert(G_settingsChangedJobs, fn)` (p_clean.lua:2499, p_temp.lua:3752).
+  A module that instead wrote a named key *and* opened with
+  `G_settingsChangedJobs = G_settingsChangedJobs or {}` worked — the consumers
+  iterate with `pairs()`, so both forms are called — but it reassigned a table
+  the host owns on the strength of a load-order assumption that was never
+  checked. If the host had created it after the module loaded, the module's
+  handler would have been silently discarded. Match the convention; it is
+  usually load-bearing for a reason you have not found yet.
+- **A file loaded from two contexts needs a token covering both.** A Sun's Dusk
+  settings file is required by the framework's GLOBAL script *and* by the
+  module's own PLAYER script — the two halves of
+  `if world then registerGroup else registerPage end`. Annotating it `global`
+  describes half of what it does. `runtime` covers it.
 - **Bundle shared libraries, do not copy them in.** Version-guard the file
   itself (`if I.X and I.X.version >= MY_VERSION then return end`) so only the
   newest loaded copy runs. `AnimRefresh`, `SharedRay`, `SuperSettingsRenderers`.
@@ -1530,6 +1556,40 @@ play through `I.AnimationController`, check the pairing first.
   wanted `none`. And `none` is only correct with **zero** requires: a data
   module pulling in `openmw.types` and required from both a player and a local
   script wants `runtime`, not `none`.
+
+- **One script path, one set of flags.** Declaring the same file under two
+  flags is a **fatal load error** — `Flags mismatch for <path>`, thrown before
+  the main menu, so the whole game refuses to start:
+  ```
+  MENU:   scripts/SunsDuskScarves/scarves_settings.lua
+  GLOBAL: scripts/SunsDuskScarves/scarves_settings.lua
+  ```
+  The mistake came from copying Sun's Dusk's
+  `if world then registerGroup else registerPage end` pattern, which genuinely
+  needs the file loaded in two contexts, and reaching for the manifest to do it.
+  `tools/check_manifest.py` catches it in a second (§4).
+- **Some frameworks load their modules themselves; check before writing a
+  manifest at all.** Sun's Dusk's entire `.omwscripts` is eight entries, and
+  `clean_settings.lua`, `g_backpacks.lua` and `p_backpacks.lua` appear in none
+  of them. `sd_g.lua` scans `scripts/SunsDusk/settings/` and
+  `scripts/SunsDusk/global_modules/`, `sd_p.lua` scans
+  `scripts/SunsDusk/player_modules/p_*`, and the VFS merges data directories, so
+  a third-party module installs by **dropping files into those directories with
+  no manifest of its own**. Mimicking a module means matching its structure, not
+  only its behaviour.
+- **A loader that runs in one context only covers one branch.** Sun's Dusk's
+  settings scan is global-only, where `world` is set and a settings file takes
+  its `registerGroup` branch. The `registerPage` branch needs a non-global
+  context, so a module must `require` its own settings file from its player
+  module — which `sd_p.lua:381` does for `sd_settings`. That require also
+  guarantees the setting globals exist before the module reads them.
+- **With an `l10n` context set, `name` and `description` are KEYS, not text.**
+  A setting passing literal prose resolves to nothing and the control renders
+  blank. The same applies to a `select` renderer's `argument`: it resolves each
+  item through localisation too, so `items` without an `l10n` field yields empty
+  labels and a dropdown with nothing to draw. This looked like a broken renderer
+  for a full session; it was the one setting in the group not written to the
+  group's own convention. Cross-reference keys used against keys defined.
 
 ## 3.7 Riding, pinning and the MWScript bridge
 
@@ -1582,6 +1642,8 @@ is in doubt.)
 | `check_names.py` | Undefined names, unused requires. |
 | `api_sweep.py` | Every `module.member` call vs the Cod3x stubs. **Run this** — a misspelled API inside a pcall-wrapped call is §2.2 again. |
 | `sweep.py` | Settings declared vs read, categories used vs defined, events sent vs handled, l10n keys, orphaned modules. |
+| `check_manifest.py` | **One script path declared under two flags.** Fatal at load and trivially detectable; nothing else in this toolchain read manifests at all. |
+| `ctxcheck.py` | `---@omw-context` annotations vs the Cod3x context policy — module, member and interface availability. See §4.7. |
 | `test_*.lua` | Mocked-API behaviour tests. |
 
 ## 4.1 A mock that accepts everything tests nothing
@@ -1678,6 +1740,108 @@ every project in this suite, with the FLOW bug still reported.
 > has only ever been run on broken code is untested in the direction that
 > matters.
 
+## 4.5 An unverified string replacement is an unverified `pcall`
+
+Editing `bones.lua` through a script of `.replace(old, new)` calls, none of which
+asserted a match. The file had already moved on — `bonesForWeapon(weaponType,
+mode)` and `shieldBone(mode)` existed in a better form than the one being
+written — so **every replacement matched nothing and the file was left
+untouched**. Nothing failed. The error surfaced later and elsewhere, when tests
+called a `shieldBoneFor` that was never created.
+
+That is the same failure shape as §2.2: an operation that quietly did not happen,
+surfacing as a confusing symptom somewhere further on. Assert first:
+
+```python
+def rep(old, new, label):
+    assert old in s, 'NO MATCH: ' + label
+    return s.replace(old, new, 1)
+```
+
+Corollary: **re-read a file before editing it**, especially one you believe you
+wrote. A stale mental model of your own code is not a smaller risk than a stale
+model of someone else's.
+
+## 4.6 A mock must exercise the path the engine takes
+
+Related to §4.1 but distinct. §4.1 is about mocks that accept wrong *values*;
+this is about mocks that bypass the real *route*.
+
+IED's `common.lua` caches its settings and refreshes the cache from a `subscribe`
+callback. A test that set `world.cfg` directly and called the handler tested a
+path the engine never takes — the cache was never refreshed, so the assertions
+passed or failed for reasons unrelated to the code under test. The fix was a
+`setCfg()` helper that writes the table **and fires the subscription**, exactly
+as a settings change does.
+
+Ask of every mock: does the production code reach this value the way my test
+supplies it? Caches, subscriptions and event relays are where the answer is no.
+
+## 4.7 Cod3x 0.4 moved the goalposts, and the old checker passed everything
+
+0.4 restructured the context plugin ("Centralize Cod3x module registrations and
+policy tables"). The previous `ctxcheck` read inline `{ global = true, ... }`
+literals out of `AVAILABILITY`; 0.4 uses symbolic context sets resolved from
+`contextSet(...)` declarations, so the old parser found **zero modules and
+silently passed every file**. A checker that stops matching its input does not
+fail — it goes quiet, which looks exactly like success.
+
+Rebuilt for 0.4, it also gained two axes the module-level check never had:
+
+- **Member availability.** `openmw.core`, `openmw.storage` and
+  `openmw.interfaces` are scoped member by member. `storage.playerSection` is
+  player/menu even though `openmw.storage` itself is available everywhere.
+- **Interface availability.** `I.Camera` is player-only, `I.AI` local-only,
+  `I.Activation` and `I.ItemUsage` global-only.
+
+The one behavioural change in 0.4 that breaks existing code:
+
+> `openmw.types` went `EVERY_CONTEXT` → `OBJECT_CONTEXT` — it **lost `menu` and
+> `load`**. A MENU script requiring `openmw.types` was always wrong and is now
+> reported. Check every settings script.
+
+Two live findings on first run over this suite, both worth their own rule.
+
+### Fix the generator, not the file it generated
+
+`cake_shared.lua` carried `---@omw-context shared`, which is not a valid token
+(§3.6). It had been corrected once, by hand, in the file. Then the registry was
+regenerated — from a generator still emitting `shared` — and the fix was
+overwritten. Nothing complained, because an invalid token and a missing one are
+poisoned identically and neither is a syntax error.
+
+**A hand-fix to a generated file is a fix with a countdown on it.** When
+`ctxcheck` reports a generated file, correct the emitter and record *why* in the
+emitter, then regenerate.
+
+### Vendored files are not yours to annotate
+
+The other finding was `SuperSelect3.lua` — bundled third-party, no annotation.
+Adding one would mean editing a vendored file, which §3.6 says not to do. This
+is an accepted, permanent finding rather than a bug, and it is worth knowing
+your sweep will always show it, so nobody "fixes" it later.
+
+## 4.8 A framework's environment globals need a preset, not a suppression
+
+Sun's Dusk assigns `core`, `types`, `world`, `saveData`, the `G_*` job tables
+and a dozen more as **globals on purpose**, then `require()`s its modules, which
+share the requiring script's environment. Sweeping a Sun's Dusk module with
+`globalcheck.py` therefore produced ~70 findings and **not one was a bug**.
+
+The wrong answers are to switch the checker off or to skip the directory. The
+right one is a named preset read out of the host (`sd_p.lua`, `sd_g.lua`,
+`constants.lua`) rather than assumed:
+
+```
+globalcheck.py --preset sunsdusk <module>
+```
+
+That takes the module to zero findings while still reporting anything the host
+does *not* define — verified by renaming one call site to
+`typesActorInvSelf` and confirming it is still caught. A preset that silences
+everything is a suppression; a preset that silences exactly the host's
+vocabulary is a specification of what the host provides.
+
 ---
 
 # Part 5 — Checklist before changing anything here
@@ -1721,8 +1885,20 @@ every project in this suite, with the FLOW bug still reported.
     shorter than the consumer's expiry (§1.16).
 16. Did you write MWScript? Every command that should affect the player needs
     the `player->` prefix (§3.7).
-17. Run `luacheck.py`, `check_names.py`, `api_sweep.py`, `sweep.py` and the
-    tests. All five, not the first one. After a `pcall` sweep, `check_names.py`
-    is the one that matters (§2.10).
-18. If you added behaviour, does the mock actually enforce the engine's
-    contract, or would it accept a wrong answer?
+17. Did you touch a `.omwscripts`? One path, one flag set — a duplicate is a
+    fatal load error (§3.6). And check whether the framework loads its modules
+    itself before writing a manifest at all.
+18. Is a setting rendering blank? With an `l10n` context, `name`, `description`
+    and a `select`'s `items` are all **keys**, not text (§3.6).
+19. Are you editing files through scripted replacements? Assert every one
+    matched, and re-read the file first (§4.5).
+20. Is the file you are fixing **generated**? Fix the emitter and regenerate, or
+    the next regeneration silently reverts you (§4.7).
+21. Sweeping a module that runs inside a framework's environment? Use the
+    preset, not a suppression (§4.8).
+22. Run `luacheck.py`, `globalcheck.py`, `check_names.py`, `api_sweep.py`,
+    `sweep.py`, `check_manifest.py`, `ctxcheck.py` and the tests. All of them, not the first
+    one. After a `pcall` sweep, `check_names.py` is the one that matters
+    (§2.10).
+23. If you added behaviour, does the mock enforce the engine's contract (§4.1),
+    and does it reach the code the way the engine does (§4.6)?

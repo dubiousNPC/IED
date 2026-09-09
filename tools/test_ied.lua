@@ -1,4 +1,4 @@
-local DIR='iedsem/IED/scripts/show-all-weapons/'
+local DIR='../scripts/show-all-weapons/'
 local fails=0
 local function check(n,c,e) if c then print('  ok   '..n) else fails=fails+1; print('  FAIL '..n..' '..tostring(e or '')) end end
 
