@@ -1,4 +1,8 @@
-local DIR='../scripts/show-all-weapons/'
+-- Relative to the MOD ROOT, matching test_povrefresh.lua. It used to be
+-- '../scripts/...', which only worked when run from tools/ -- so the two test
+-- files in the same directory needed different working directories and one of
+-- them silently failed to open its input.
+local DIR='scripts/show-all-weapons/'
 local fails=0
 local function check(n,c,e) if c then print('  ok   '..n) else fails=fails+1; print('  FAIL '..n..' '..tostring(e or '')) end end
 
