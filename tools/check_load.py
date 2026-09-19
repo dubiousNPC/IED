@@ -37,7 +37,6 @@ LIB = '/usr/lib/x86_64-linux-gnu/liblua5.4.so.0'
 
 HARNESS = r'''
 local files = FILES
-local presetGlobals = PRESET
 
 local stub
 stub = setmetatable({}, {
@@ -71,15 +70,6 @@ stub = setmetatable({}, {
     __eq       = function() return false end,
 })
 
--- A framework that injects its environment as globals and then require()s its
--- modules (Sun's Dusk) leaves those names undefined here, so every module
--- reports a false failure on the first one it touches. Predefine them as the
--- stub -- a preset naming exactly what the host provides, not a blanket
--- suppression (RESEARCH 4.10). Anything NOT in the preset still reports.
-for _, name in ipairs(presetGlobals) do
-    if _G[name] == nil then _G[name] = stub end
-end
-
 -- Project-local requires must resolve for real: `scripts.take_a_seat.x` is a
 -- path relative to the mod root, and reporting it as missing would hide the
 -- load errors inside it behind a require failure.
@@ -98,6 +88,18 @@ setmetatable(package.preload, { __index = function(_, name)
         return function() return stub end
     end
 end })
+
+-- Host-provided globals (--preset). A Sun's Dusk module reads names its host
+-- assigns on purpose; without them every module fails to load for a reason the
+-- engine would never give. Seeded with the right SHAPE -- a string where the host
+-- has a string, a function where it has a function, a real table for the job
+-- buses so table.insert works -- not a blanket stub.
+for name, kind in pairs(PRESET_GLOBALS) do
+    if kind == "string" then _G[name] = "SunsDusk"
+    elseif kind == "func" then _G[name] = function() end
+    elseif kind == "table" then _G[name] = {}
+    else _G[name] = stub end
+end
 
 local fails = 0
 for _, path in ipairs(files) do
@@ -122,7 +124,24 @@ FAILED = fails
 '''
 
 
-def run(files, preset=()):
+# Same names as globalcheck.py's `sunsdusk` preset, read out of sd_p.lua,
+# sd_g.lua and constants.lua. Kinds match what the host assigns.
+PRESETS = {
+    'sunsdusk': dict(
+        [(n, 'stub') for n in ('core types util world I animation ambient camera '
+                               'input nearby storage vfs async self '
+                               'typesActorInventorySelf typesActorSpellsSelf').split()]
+        + [('MODNAME', 'string'), ('log', 'func'), ('makeButton', 'func'),
+           ('saveData', 'table'), ('G_globalSettingDefaults', 'table')]
+        + [(n, 'table') for n in ('G_eventHandlers G_onFrameJobs G_onFrameJobsSluggish '
+                                  'G_onLoadJobs G_onSaveJobs G_UiModeChangedJobs '
+                                  'G_settingsChangedJobs G_perMinuteJobs G_onConsumeJobs '
+                                  'G_onInventoryChangedJobs G_removeAbilitiesJobs').split()]),
+}
+PRESET_GLOBALS = {}
+
+
+def run(files):
     lua = ctypes.CDLL(LIB)
     lua.luaL_newstate.restype = ctypes.c_void_p
     lua.luaL_openlibs.argtypes = [ctypes.c_void_p]
@@ -141,14 +160,13 @@ def run(files, preset=()):
     lua.lua_close.argtypes = [ctypes.c_void_p]
 
     listing = '{' + ','.join('[[%s]]' % f for f in files) + '}'
-    preset_lua = '{' + ','.join('[[%s]]' % n for n in preset) + '}'
     # A mod root is the directory containing `scripts/`, so a require of
     # `scripts.foo.bar` resolves the same way the engine resolves it.
     roots = sorted({f.split(os.sep + 'scripts' + os.sep)[0]
                     for f in files if os.sep + 'scripts' + os.sep in f})
     path = ';'.join(os.path.join(r, '?.lua') for r in roots) or '?.lua'
-    src = (HARNESS.replace('FILES', listing)
-                  .replace('PRESET', preset_lua)
+    pg = '{' + ','.join('[%r]=%r' % (k, v) for k, v in PRESET_GLOBALS.items()) + '}'
+    src = (HARNESS.replace('PRESET_GLOBALS', pg).replace('FILES', listing)
                   .replace('ROOTS', '[[%s]]' % path)).encode()
 
     L = lua.luaL_newstate()
@@ -172,30 +190,14 @@ def main(argv):
     # That is a limit of this approach, not a bug in the file, so such files are
     # skipped BY NAME rather than papered over with a looser stub that would
     # start missing real failures.
-    # Same list globalcheck.py uses, for the same reason.
-    PRESETS = {
-        'sunsdusk': (
-            'core types util world I animation ambient camera input nearby '
-            'storage vfs async self MODNAME saveData log makeButton '
-            'typesActorInventorySelf typesActorSpellsSelf '
-            'G_eventHandlers G_onFrameJobs G_onFrameJobsSluggish G_onLoadJobs '
-            'G_onSaveJobs G_UiModeChangedJobs G_settingsChangedJobs '
-            'G_perMinuteJobs G_onConsumeJobs G_onInventoryChangedJobs '
-            'G_removeAbilitiesJobs G_globalSettingDefaults'
-        ).split(),
-    }
-    preset = []
-
     skip = []
     args = []
     i = 0
     while i < len(argv):
         if argv[i] == '--preset' and i + 1 < len(argv):
-            name = argv[i + 1].strip().lower()
-            if name not in PRESETS:
-                print('unknown preset %r; have: %s' % (name, ', '.join(sorted(PRESETS))))
-                return 2
-            preset += PRESETS[name]
+            if argv[i + 1] not in PRESETS:
+                raise SystemExit('unknown preset %r; have: %s' % (argv[i + 1], ', '.join(PRESETS)))
+            PRESET_GLOBALS.update(PRESETS[argv[i + 1]])
             i += 2
         elif argv[i] == '--skip' and i + 1 < len(argv):
             skip += [x.strip() for x in argv[i + 1].split(',') if x.strip()]
@@ -218,7 +220,7 @@ def main(argv):
     if not files:
         print('no .lua files')
         return 0
-    return 1 if run(files, preset) else 0
+    return 1 if run(files) else 0
 
 
 if __name__ == '__main__':

@@ -312,7 +312,27 @@ local function handler(actor, equippedWeapon, equippedShield, isDrawn, isPlayer,
     --
     -- So the rebuild reports whether it found bones for what it meant to draw,
     -- and the AnimRefresh subscription passes that answer back to the service.
+    --
+    -- CAREFUL: "not ready" must mean TRANSIENTLY unavailable, not absent. A bone
+    -- that is simply not on this skeleton -- a player without the weapon
+    -- sheathing resource, or the missing Bip01 SpearTwoWideSem -- is never
+    -- going to appear, and reporting it as not-ready made AnimRefresh retry and
+    -- then log a give-up line on every single perspective change, forever:
+    --
+    --   [AnimRefresh] 'InventoryEquipmentDisplay' still not ready after 2
+    --   attempts; giving up on this change
+    --
+    -- twice per POV press, since v3 also fires a confirmation pass. RESEARCH
+    -- 1.8 already says it: a missing bone is usually a missing skeleton, not a
+    -- race.
+    --
+    -- The only state that is genuinely transient is the animation object being
+    -- rebuilt, and then NOTHING resolves -- not the Sem bones, not the standard
+    -- ones, not the vanilla fallback. So readiness is judged on that: if even
+    -- one bone answered, the skeleton is up and whatever did not resolve is
+    -- absent by configuration, which no retry can fix.
     local ready = true
+    local anyBoneResolved = false
 
     -- Attaching to a bone the skeleton lacks is a SILENT no-show, so every
     -- candidate is checked before it is taken. Memoized for this rebuild only:
@@ -381,16 +401,21 @@ local function handler(actor, equippedWeapon, equippedShield, isDrawn, isPlayer,
                 if enabled('showWeapons') and rid ~= equippedWeaponId
                    and not seen[rid] then
                     for _, candidate in ipairs(bones.bonesForWeapon(wt, mode)) do
-                        if not boneTaken[candidate] and usable(candidate) then
-                            bone = candidate
-                            break
+                        if usable(candidate) then
+                            anyBoneResolved = true
+                            if not boneTaken[candidate] then
+                                bone = candidate
+                                break
+                            end
                         end
                     end
                 end
 
                 if not bone and enabled('showWeapons') and rid ~= equippedWeaponId
                    and not seen[rid] then
-                    -- Wanted a bone for this weapon and no candidate existed.
+                    -- Wanted a bone and got none. Only a not-ready signal if
+                    -- the skeleton looks absent entirely; otherwise the bone is
+                    -- simply not on this rig and retrying changes nothing.
                     ready = false
                 end
 
@@ -449,9 +474,15 @@ local function handler(actor, equippedWeapon, equippedShield, isDrawn, isPlayer,
     -- the fallback here too, so a skeleton without the Sem shield bone still
     -- shows the shield rather than nothing.
     local shieldBone = bones.shieldBone(mode)
-    if not usable(shieldBone) then
+    if usable(shieldBone) then
+        anyBoneResolved = true
+    else
         shieldBone = bones.SHIELD_BONE
-        if not usable(shieldBone) then ready = false end
+        if usable(shieldBone) then
+            anyBoneResolved = true
+        else
+            ready = false
+        end
     end
     for _, item in ipairs(inv:getAll(types.Armor)) do
         if shieldsShown >= MAX_SHIELDS then break end
@@ -468,7 +499,10 @@ local function handler(actor, equippedWeapon, equippedShield, isDrawn, isPlayer,
         end
     end
 
-    return ready
+    -- Downgrade to "ready" whenever any bone on this skeleton answered. The
+    -- skeleton is up; the misses are configuration, and asking again produces
+    -- the same answer and a log line.
+    return ready or anyBoneResolved
 end
 
 -- ---------------------------------------------------------------------------

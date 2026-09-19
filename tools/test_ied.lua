@@ -298,5 +298,29 @@ inv={}; world.vfx={}
 check('empty inventory reports ready, not a retry loop',
       subs['InventoryEquipmentDisplay']() ~= false)
 
+print('readiness is transient-only')
+-- The log spam: a bone that is simply not on this skeleton must NOT be
+-- reported as not-ready, or AnimRefresh retries and logs a give-up line on
+-- every perspective change, forever.
+inv={mk('spear1',W.SpearTwoWide)}
+world.equip={}; world.vfx={}
+setCfg{baseSlots='alternative'}
+-- The Sem spear bone does not exist; the standard one does.
+world.bones['Bip01 SpearTwoWideSem']=nil
+world.bones['Bip01 SpearTwoWide']=true
+world.bones['Bip01 AttachShield']=true
+local r1 = common.handler(nil,nil,nil,false,true)
+check('a bone absent from a LIVE skeleton reports ready', r1 ~= false,
+      'this is what produced "still not ready after 2 attempts" on every POV change')
+
+-- A skeleton mid-rebuild resolves nothing at all -- that IS transient.
+local saved = {}
+for k,v in pairs(world.bones) do saved[k]=v end
+world.bones = {}
+world.vfx = {}
+local r2 = common.handler(nil,nil,nil,false,true)
+check('a skeleton where NOTHING resolves reports not-ready', r2 == false)
+world.bones = saved
+
 print(fails==0 and 'ALL PASS' or (fails..' FAILURES'))
 if fails>0 then os.exit(1) end
