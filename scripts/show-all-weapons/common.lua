@@ -47,7 +47,7 @@ local M = {}
 -- TUNING
 -- ---------------------------------------------------------------------------
 
--- Seconds between change checks. The check itself is cheap (see Snapshot)
+-- Seconds between change checks. The check itself is cheap (see buildSignature)
 -- and a full rebuild only happens when something actually moved. Overridable
 -- from settings; this is the fallback when the global section has not been
 -- seeded yet.
@@ -271,107 +271,26 @@ local function readState(actor)
     return equippedWeapon, equippedShield, isDrawn
 end
 
--- The one definition of "a shield IED would draw". The rebuild's shield loop
--- and the change detector both use it, so they cannot disagree about which
--- armor matters.
-local function isDisplayableShield(rec)
-    return rec ~= nil and rec.model ~= nil and rec.type == types.Armor.TYPE.Shield
-end
-
--- ---------------------------------------------------------------------------
--- CHANGE DETECTION
--- ---------------------------------------------------------------------------
--- A flat list of values that decide what IED draws, compared against the
--- previous poll's list IN PLACE. Each value is pushed and compared against
--- the slot it occupied last time; a mismatch overwrites that slot and marks
--- the snapshot changed.
+-- Cheap change detector. Deliberately avoids record() lookups -- recordId and
+-- count are already on the object -- so the common "nothing changed" path never
+-- touches the record store or the filesystem.
 --
--- This replaced a string signature (`recordId .. ":" .. count` per item, then
--- table.concat, then a settings suffix) that allocated every poll, on every
--- NPC, including the overwhelmingly common poll where nothing had changed.
--- Here the unchanged path writes nothing: the only tables are the ones
--- getAll and getEquipment return, which are the engine's, not ours to avoid.
---
--- Only armor that isDisplayableShield is pushed. The old signature included
--- every armor piece, so an NPC swapping a cuirass or a helm triggered a full
--- rebuild of gear that could not have changed. The filter costs one
--- armorRecord() lookup, which is cached per recordId, so after the first poll
--- it is a table read.
---
--- getAll ordering is not documented as stable; if it ever varies the snapshot
+-- getAll ordering is not documented as stable; if it ever varies the signature
 -- differs and we do one redundant rebuild, which is harmless.
-local function newSnapshot()
-    local vals = {}
-    local len  = -1      -- -1: never taken, so the first comparison differs
-    local pos, changed = 0, false
-
-    local snap = {}
-
-    function snap.begin()
-        pos, changed = 0, false
-    end
-
-    function snap.push(v)
-        pos = pos + 1
-        if vals[pos] ~= v then
-            vals[pos] = v
-            changed = true
-        end
-    end
-
-    ---@return boolean changed since the previous finish()
-    function snap.finish()
-        if pos ~= len then
-            for i = pos + 1, #vals do vals[i] = nil end
-            len = pos
-            changed = true
-        end
-        return changed
-    end
-
-    -- Forget the previous state, so the next comparison reports a change.
-    -- Used when the display is cleared outside a rebuild.
-    function snap.invalidate()
-        len = -1
-    end
-
-    return snap
-end
-
--- Pushes everything a rebuild depends on. Keep this in step with handler():
--- if the rebuild starts reading something new, it has to be pushed here too,
--- or a change to it will not be noticed until something else changes.
-local function pushState(snap, inv, equippedWeaponId, equippedShieldId, isDrawn, cfg)
-    snap.push(equippedWeaponId or false)
-    snap.push(equippedShieldId or false)
-    snap.push(isDrawn)
-    snap.push(cfg.showWeapons)
-    snap.push(cfg.showShields)
-    snap.push(cfg.showAmmo)
-    -- baseSlots belongs here too: switching to combined changes which bones
-    -- are used and how many attachments there are, but nothing about the
-    -- inventory, so without it the change would not be seen until the player
-    -- next picked something up.
-    snap.push(cfg.baseSlots)
-
-    -- Separator values that cannot collide with a recordId or a count, so a
-    -- weapon list that shrinks by one while the shield list grows by one is
-    -- still a different sequence.
+local function buildSignature(actor, equippedWeaponId, equippedShieldId, isDrawn, inv)
+    inv = inv or types.Actor.inventory(actor)
+    local parts = {
+        equippedWeaponId or "-",
+        equippedShieldId or "-",
+        isDrawn and "1" or "0",
+    }
     for _, item in ipairs(inv:getAll(types.Weapon)) do
-        snap.push(item.recordId)
-        snap.push(item.count)
+        parts[#parts + 1] = item.recordId .. ":" .. item.count
     end
-    snap.push(false)
-    -- Skipped outright when shields are hidden: nothing in the armor list can
-    -- change what is drawn, and showShields itself is pushed above.
-    if cfg.showShields ~= false then
-        for _, item in ipairs(inv:getAll(types.Armor)) do
-            if isDisplayableShield(armorRecord(item)) then
-                snap.push(item.recordId)
-                snap.push(item.count)
-            end
-        end
+    for _, item in ipairs(inv:getAll(types.Armor)) do
+        parts[#parts + 1] = item.recordId .. ":" .. item.count
     end
+    return table.concat(parts, "|")
 end
 
 -- ---------------------------------------------------------------------------
@@ -570,7 +489,7 @@ local function handler(actor, equippedWeapon, equippedShield, isDrawn, isPlayer,
         local rid = item.recordId
         if rid ~= equippedShieldId then
             local rec = armorRecord(item)
-            if isDisplayableShield(rec) then
+            if rec and rec.model and rec.type == types.Armor.TYPE.Shield then
                 if attachVfx(actor, normPath(rec.model),
                              shieldBone,
                              "saw_sh_" .. shieldsShown) then
@@ -597,27 +516,34 @@ function M.makeUpdateHandler(actor, isPlayer)
     -- it allocated a fresh userdata on every poll and again inside every
     -- rebuild -- twice per cycle, forever, for a value that never changes.
     -- RESEARCH 1.10 says to hoist it; this is that.
-    local inv          = types.Actor.inventory(actor)
-    local timer        = 0
-    local snap         = newSnapshot()
-    local cleared      = false   -- display cleared by the NPC toggle
-    local forceRebuild = true    -- first pass always builds
+    local inv           = types.Actor.inventory(actor)
+    local timer         = 0
+    local lastSignature = nil
+    local forceRebuild  = true   -- first pass always builds
 
-    -- One snapshot pass for both paths. rebuildNow used to store a signature
-    -- WITHOUT the settings suffix while the poll computed one WITH it, so the
-    -- two could never compare equal and every forced rebuild was followed by
-    -- a redundant one on the next tick. Both paths now go through here.
-    ---@return boolean changed, any w, any s, boolean drawn
-    local function takeSnapshot()
+    -- One signature builder for both paths. rebuildNow used to store a
+    -- signature WITHOUT the settings suffix while the poll computed one WITH
+    -- it, so the two could never compare equal and every forced rebuild was
+    -- followed by a redundant one on the next tick.
+    local function currentSignature()
         local w, s, drawn = readState(actor)
-        snap.begin()
-        pushState(snap, inv, w and w.recordId, s and s.recordId, drawn, cfgCache)
-        return snap.finish(), w, s, drawn
+        return buildSignature(actor,
+            w and w.recordId or nil, s and s.recordId or nil, drawn, inv)
+            .. '|' .. tostring(cfgCache.showWeapons)
+            .. tostring(cfgCache.showShields)
+            .. tostring(cfgCache.showAmmo)
+            -- baseSlots belongs here too: switching to combined changes which
+            -- bones are used and how many attachments there are, but nothing
+            -- about the inventory, so without it the change would not be seen
+            -- until the player next picked something up.
+            .. tostring(cfgCache.baseSlots),
+            w, s, drawn
     end
 
     ---@return boolean ready
     local function rebuildNow()
-        local _, w, s, drawn = takeSnapshot()
+        local signature, w, s, drawn = currentSignature()
+        lastSignature = signature
         local ready = handler(actor, w, s, drawn, isPlayer, inv)
         forceRebuild = false
         return ready
@@ -641,7 +567,10 @@ function M.makeUpdateHandler(actor, isPlayer)
             -- This mod bundles v2. It should use the protocol it ships.
             local ready = rebuildNow()
             if not ready then return false end
-        end)
+        -- verify: a rebuild that completes after this delivery drops what was
+        -- just attached, and nothing can read that back. The re-attach is
+        -- remove-then-add, so paying for one extra delivery is free here.
+        end, { verify = true })
     end
 
     return function(dt)
@@ -656,39 +585,27 @@ function M.makeUpdateHandler(actor, isPlayer)
         -- IED.omwscripts, which stops the script existing at all. This is the
         -- next best thing, and unlike that it can be toggled in-game.
         if not isPlayer and not cfgCache.showNpcs then
-            if not cleared then
+            if lastSignature ~= false then
                 clearVfx(actor)
-                cleared      = true
-                forceRebuild = false
-                -- The display no longer matches the snapshot. Without this,
-                -- re-enabling would compare equal and draw nothing until the
-                -- NPC's gear next changed.
-                snap.invalidate()
+                lastSignature = false
+                forceRebuild  = false
             end
             return
         end
-        cleared = false
 
         timer = timer + (dt or 0)
         if timer < pollInterval() and not forceRebuild then return end
+        timer = 0
 
         if forceRebuild then
             rebuildNow()
-            -- Random phase, set once. Every NPC in a cell is activated in the
-            -- same frame, so a shared timer = 0 put all of them on the same
-            -- poll frame, every interval, forever: one frame paying for the
-            -- whole cell while the frames between paid nothing. Starting
-            -- each actor somewhere in [0, interval) spreads the same total
-            -- work evenly (see tools/test_poll.lua, section 1). The first
-            -- build itself stays immediate so gear never pops in late.
-            timer = math.random() * pollInterval()
             return
         end
-        timer = 0
 
-        local changed, w, s, drawn = takeSnapshot()
-        if not changed then return end
+        local signature, w, s, drawn = currentSignature()
+        if signature == lastSignature then return end
 
+        lastSignature = signature
         handler(actor, w, s, drawn, isPlayer, inv)
     end
 end

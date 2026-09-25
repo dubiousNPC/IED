@@ -1,47 +1,25 @@
 # IED v0.65
 
-**Poll rework: spread, allocation-free, shield-only.** No behaviour change to
-what is drawn. Measured with the new `tools/test_poll.lua`, which drives the
-real `makeUpdateHandler` against counting mocks:
+## AnimRefresh v3 -> v4
 
-| | v0.64 | v0.65 |
-|---|---|---|
-| NPCs polling in the worst frame (40 NPCs, 0.5 s) | **40** | **4** (even spread ≈ 1.33) |
-| Lua allocated by IED per unchanged poll | **652 bytes** | **0 bytes** |
-| Rebuild when an NPC swaps a cuirass | yes | no |
+Bundled AnimRefresh is now `scripts/AnimRefresh/AnimRefresh_v4.lua`, rewritten
+after a review by the author of Sun's Dusk. It fires once per real model
+rebuild instead of four times per POV press, stops firing at all for
+vanity/preview (which rebuild nothing), and now covers the two causes v3
+missed entirely: **Rest/Travel/Training/Jail** and **loading a save**. The
+manifest line changed with the filename.
 
-**1. Every NPC polled in the same frame.** Each actor's timer started at 0,
-and every NPC in a cell is activated in the same frame. So the whole cell
-polled together every interval, forever. After the (still immediate) first
-build, each actor now starts at a random phase in `[0, pollInterval)`. The
-total work is the same; the per-frame spike is gone.
+This mod subscribes with `{ verify = true }`: its re-attach is
+`removeVfx` + `addVfx`, so the second delivery that covers a late rebuild
+is invisible here. `tools/test_povrefresh.lua` drives the real v4 and still
+recovers gear from a rebuild that completes 0.8s after the switch.
 
-**2. The signature allocated on every poll.** `buildSignature` built a
-`recordId .. ":" .. count` string per weapon and armor item, concatenated them,
-and appended a settings suffix, all on the common path where nothing had
-changed. It is replaced by a snapshot compared in place (`newSnapshot` /
-`pushState`). An unchanged poll writes nothing; the only tables left are the
-ones `getAll` and `getEquipment` return.
-
-**3. Non-shield armor triggered rebuilds.** Every armor piece went into the
-signature, but only shields are ever drawn. `isDisplayableShield` is now the
-single predicate the rebuild and the change detector share, and the armor scan
-is skipped outright when shields are hidden. The filter uses the existing
-per-recordId `armorRecord` cache, so it costs a table read after the first
-poll.
-
-The NPC display toggle clears through a `cleared` flag plus
-`snap.invalidate()`. Removing that invalidate makes re-enabling draw nothing;
-`test_poll.lua` section 4 fails without it (mutation-checked).
-
-Unchanged and noted: `check_load.py` reports the bundled
-`SuperSettingsRenderers/SuperSelect3.lua` failing to load under its mock
-(`gmatch` given a table). That was already the case in v0.64 and is not
-touched here.
+Full reasoning, measurements and the subscriber contract: `ANIMREFRESH_V4.md`.
+Tested by `tools/test_animrefresh.lua` (19 checks) plus this mod's own suite.
 
 ---
 
-## v0.64
+# IED v0.62
 
 ---
 

@@ -5,7 +5,7 @@
 -- tested IED's callback in isolation and could not see that the SERVICE was
 -- losing the change (RESEARCH 4.6: a mock must exercise the path the engine
 -- takes). Run from the mod root.
-local A='scripts/AnimRefresh/AnimRefresh_v3.lua'
+local A='scripts/AnimRefresh/AnimRefresh_v4.lua'
 local C='scripts/show-all-weapons/common.lua'
 
 local world={vfx={},bones={},files={},equip={},stance=0,cfg={},mode='third'}
@@ -41,7 +41,8 @@ local invObj={getAll=function(_,t)
     end; return out end}
 
 package.preload['openmw.camera']=function() return {
-  MODE={FirstPerson='first',ThirdPerson='third'}, getMode=function() return world.mode end} end
+  MODE={FirstPerson='first',ThirdPerson='third'}, getMode=function() return world.mode end,
+  getQueuedMode=function() return world.queued end} end
 package.preload['openmw.input']=function() return {
   triggers={TogglePOV=true},
   registerTriggerHandler=function(name,cb) world.trigger=cb end} end
@@ -87,9 +88,11 @@ print('after first build, vfx on bone:', tostring(world.vfx['Bip01 LongBladeOneH
 -- POV press: engine drops the VFX and rebuilds the animation object.
 print('\n-- player presses TogglePOV --')
 world.vfx = {}                 -- engine dropped them
-assert(world.trigger, 'no TogglePOV handler registered!')
-world.trigger()                -- trigger fires
-world.mode = 'first'
+-- v4 detects the switch itself: the boundary flips and getQueuedMode() goes
+-- nil when the camera has settled. There is no TogglePOV handler any more.
+world.queued = 'first'
+AR.engineHandlers.onUpdate(0.05)   -- mid-transition: must NOT deliver yet
+world.mode, world.queued = 'first', nil
 
 -- The engine finishes replacing the animation object LATER than the 0.1s
 -- settle guess, and wipes attached VFX when it does.
@@ -110,7 +113,7 @@ print((recovered and '  ok   ' or '  FAIL ')
       .. ('gear recovered after a rebuild that completed at t=%.2f'):format(WIPE_AT))
 if not recovered then FAILED = true end
 print(('after %.1fs, vfx on bone: %s'):format(now, tostring(world.vfx['Bip01 LongBladeOneHand'])))
-print('AnimRefresh lastMode now:', AR.interface.getMode(), ' actual mode:', world.mode)
+print('AnimRefresh mode now:', AR.interface.getMode(), ' actual mode:', world.mode)
 
 print('\n-- now the player draws a weapon --')
 world.stance = 1
