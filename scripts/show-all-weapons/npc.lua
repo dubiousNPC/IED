@@ -1,11 +1,13 @@
 ---@omw-context local
+
 local self   = require('openmw.self')
 local common = require('scripts.show-all-weapons.common')
 
--- isPlayer omitted deliberately: this actor is subject to the "NPCs display
--- gear" toggle, which the player is not.
+local onUpdate, onActive = common.makeUpdateHandler(self)
+
 return {
     engineHandlers = {
-        onUpdate = common.makeUpdateHandler(self),
+        onUpdate = onUpdate,
+        onActive = onActive,
     }
 }

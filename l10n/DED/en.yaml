@@ -1,0 +1,29 @@
+settings_modName: "Dubious Equipment Display"
+settings_modDesc: "Shows carried weapons, shields and ammunition on the body, using the same sheath bones as OpenMW's own weapon sheathing."
+
+settings_general: "General"
+
+setting_baseslots: "Base slots"
+setting_baseslots_desc: "Which set of skeleton bones sheathed gear attaches to.\n\nStandard uses the original _sh sheathing slots, the same bones OpenMW's own weapon sheathing uses.\n\nAlternative uses the Ded slots added by DedBones.nif, positioned for sheathed gear rather than reused from the sheathing rig.\n\nCombined layers both: Standard fills first, then the Ded slots take one extra weapon of each type. Shields and the quiver still show one each. Player only, since doubling every NPC's attachments is the cost this mod avoids.\n\nStandard is always the fallback: any bone missing from a skeleton degrades to the Standard one rather than showing nothing."
+
+standard: "Standard"
+alternative: "Alternative"
+combined: "Combined"
+
+setting_shownpcs: "NPCs display carried gear"
+setting_shownpcs_desc: "Show carried weapons and shields on other actors. Turning this off strips them immediately; your own gear is unaffected."
+
+setting_npcrange: "NPC display range"
+setting_npcrange_desc: "NPCs further than this from you (in game units; one exterior cell is 8192) do not display carried gear, and cost only an occasional distance check. NPCs slightly beyond the range keep their gear until they move well past it, so nothing flickers at the edge.\n\n0 means no limit."
+
+setting_showweapons: "Show carried weapons"
+setting_showweapons_desc: "Display unequipped weapons on their sheath bones."
+
+setting_showshields: "Show carried shields"
+setting_showshields_desc: "Display an unequipped shield on the back. A shield you have equipped is drawn by OpenMW's own sheathing and is never duplicated here."
+
+setting_showammo: "Show quiver"
+setting_showammo_desc: "Display equipped arrows or bolts. Requires a skeleton providing numbered ammo bones; has no effect without one."
+
+setting_pollinterval: "Update interval (seconds)"
+setting_pollinterval_desc: "How often to check whether your carried gear changed. NPCs check at twice this interval. The check does no record or file lookups and allocates nothing when nothing changed, so raising this saves little."

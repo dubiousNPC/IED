@@ -38,8 +38,17 @@ local AR = dofile(PATH)
 IFACES[AR.interfaceName] = AR.interface
 local AN = IFACES.AnimRefresh
 local H = AR.engineHandlers
+local E = AR.eventHandlers or {}
 check('registers version 4', AN.version == 4)
 check('no TogglePOV trigger handler is registered', true)   -- nothing to register into
+-- Every OpenMW engine handler is named on*. Anything else under engineHandlers
+-- is logged as "Not supported handler" and never called -- which is how
+-- UiModeChanged (an EVENT) sat dead in engineHandlers while every test that
+-- called H.UiModeChanged directly still passed.
+local bad = {}
+for k in pairs(H) do if not k:match('^on%u') then bad[#bad + 1] = k end end
+check('engineHandlers holds only engine handler names', #bad == 0, table.concat(bad, ','))
+check('UiModeChanged is registered as an event handler', type(E.UiModeChanged) == 'function')
 
 local n = 0
 local TRACE=os.getenv('AR_TRACE')
@@ -98,12 +107,12 @@ AN.unsubscribe('B')
 
 -- UI modes ------------------------------------------------------------------
 n = 0
-H.UiModeChanged({ oldMode = 'Rest', newMode = nil })
+E.UiModeChanged({ oldMode = 'Rest', newMode = nil })
 settle()
 check('closing Rest delivers a refresh', n == 1, n)
 n = 0
-H.UiModeChanged({ oldMode = 'Inventory', newMode = nil })
-H.UiModeChanged({ oldMode = nil, newMode = 'Rest' })
+E.UiModeChanged({ oldMode = 'Inventory', newMode = nil })
+E.UiModeChanged({ oldMode = nil, newMode = 'Rest' })
 settle()
 check('opening a menu, or closing Inventory, delivers nothing', n == 0, n)
 

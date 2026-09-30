@@ -71,6 +71,7 @@ package.preload['openmw.storage']=function() return {
 -- common.lua reads it.
 local IFACES = {}
 package.preload['openmw.interfaces']=function() return IFACES end
+package.preload['openmw.nearby']=function() return { players = {} } end
 
 local AR = dofile(A)
 IFACES[AR.interfaceName] = AR.interface

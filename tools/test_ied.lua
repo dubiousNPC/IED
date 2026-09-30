@@ -67,6 +67,7 @@ package.preload['openmw.async']=function() return {
     callback=function(_,f) return f end,
     newUnsavableSimulationTimer=function(_,_,f) f() end } end
 package.preload['openmw.interfaces']=function() return {} end
+package.preload['openmw.nearby']=function() return { players = {} } end
 package.preload['scripts.show-all-weapons.bones']=function() return dofile(DIR..'bones.lua') end
 
 local bones=dofile(DIR..'bones.lua')
@@ -143,35 +144,35 @@ print('base slots')
 -- handler's 5th arg is isPlayer; combined is player-only.
 local function asPlayer(w,sh,drawn) common.handler(nil,w,sh,drawn,true) end
 local function asNpc(w,sh,drawn)    common.handler(nil,w,sh,drawn,nil)  end
--- Standard must never use Sem bones, even on a skeleton that has them.
-world.bones['Bip01 LongBladeOneHandSem']=true
-world.bones['Bip01 AxeOneHandSem']=true
+-- Standard must never use Ded bones, even on a skeleton that has them.
+world.bones['Bip01 LongBladeOneHandDed']=true
+world.bones['Bip01 AxeOneHandDed']=true
 inv={mk('ls9',W.LongBladeOneHand)}; world.equip={}; world.vfx={}
 setCfg{baseSlots='standard'}
 common.handler(nil,nil,nil,false)
 check('standard uses the original _sh slot',
-      world.vfx['Bip01 LongBladeOneHand']~=nil and world.vfx['Bip01 LongBladeOneHandSem']==nil)
+      world.vfx['Bip01 LongBladeOneHand']~=nil and world.vfx['Bip01 LongBladeOneHandDed']==nil)
 
 world.vfx={}; setCfg{baseSlots='alternative'}
 common.handler(nil,nil,nil,false)
-check('alternative uses the _Sem slot',
-      world.vfx['Bip01 LongBladeOneHandSem']~=nil and world.vfx['Bip01 LongBladeOneHand']==nil)
+check('alternative uses the _Ded slot',
+      world.vfx['Bip01 LongBladeOneHandDed']~=nil and world.vfx['Bip01 LongBladeOneHand']==nil)
 
--- On Sem, axes get their own bone, so the standard collision disappears.
+-- On Ded, axes get their own bone, so the standard collision disappears.
 inv={mk('ls10',W.LongBladeOneHand), mk('axe10',W.AxeOneHand)}
 world.vfx={}; world.doubled=0
 common.handler(nil,nil,nil,false)
 check('alternative gives axes their own bone, so no collision',
-      world.vfx['Bip01 LongBladeOneHandSem']~=nil
-      and world.vfx['Bip01 AxeOneHandSem']~=nil and (world.doubled or 0)==0)
+      world.vfx['Bip01 LongBladeOneHandDed']~=nil
+      and world.vfx['Bip01 AxeOneHandDed']~=nil and (world.doubled or 0)==0)
 
--- A skeleton without the Sem bones must fall back, not show nothing.
-world.bones['Bip01 LongBladeOneHandSem']=nil
-world.bones['Bip01 AxeOneHandSem']=nil
+-- A skeleton without the Ded bones must fall back, not show nothing.
+world.bones['Bip01 LongBladeOneHandDed']=nil
+world.bones['Bip01 AxeOneHandDed']=nil
 inv={mk('ls11',W.LongBladeOneHand)}; world.vfx={}
 setCfg{baseSlots='alternative'}
 common.handler(nil,nil,nil,false)
-check('alternative falls back to standard when the Sem bones are absent',
+check('alternative falls back to standard when the Ded bones are absent',
       world.vfx['Bip01 LongBladeOneHand']~=nil,
       'a missing bone is a SILENT no-show, so this must be checked')
 
@@ -181,18 +182,18 @@ common.handler(nil,nil,nil,false)
 check('unset baseSlots behaves as standard', world.vfx['Bip01 LongBladeOneHand']~=nil)
 
 print('combined mode')
-world.bones['Bip01 LongBladeOneHandSem']=true
-world.bones['Bip01 AxeOneHandSem']=true
-world.bones['Bip01 AttachShieldSem']=true
+world.bones['Bip01 LongBladeOneHandDed']=true
+world.bones['Bip01 AxeOneHandDed']=true
+world.bones['Bip01 AttachShieldDed']=true
 
--- two DIFFERENT long blades: standard takes the first, Sem the second
+-- two DIFFERENT long blades: standard takes the first, Ded the second
 inv={mk('blade_a',W.LongBladeOneHand), mk('blade_b',W.LongBladeOneHand)}
 world.equip={}; world.vfx={}; world.doubled=0
 setCfg{baseSlots='combined'}
 asPlayer(nil,nil,false)
-check('combined fills the standard slot AND the Sem slot',
+check('combined fills the standard slot AND the Ded slot',
       world.vfx['Bip01 LongBladeOneHand']~=nil
-      and world.vfx['Bip01 LongBladeOneHandSem']~=nil
+      and world.vfx['Bip01 LongBladeOneHandDed']~=nil
       and (world.doubled or 0)==0)
 
 -- a third has nowhere to go
@@ -212,16 +213,16 @@ local shields=0
 for _,v in pairs(world.vfx) do if tostring(v):find('saw_sh_') then shields=shields+1 end end
 check('combined does NOT add a second shield', shields==1, shields)
 check('combined puts the shield on the STANDARD bone',
-      world.vfx['Bip01 AttachShield']~=nil and world.vfx['Bip01 AttachShieldSem']==nil)
+      world.vfx['Bip01 AttachShield']~=nil and world.vfx['Bip01 AttachShieldDed']==nil)
 
--- NO second quiver: Arrow has no Sem override
+-- NO second quiver: Arrow has no Ded override
 world.bones['Bip01 Ammo 1']=true; world.bones['Bip01 Ammo 2']=true
 local bow=mk('bow1',W.MarksmanBow); local arrow=mk('arrow1',W.Arrow)
 inv={bow,arrow}; world.equip={}; world.ammoEquipped=arrow
 world.vfx={}
 asPlayer(nil,nil,false)
 check('combined does NOT add a second quiver bone',
-      world.vfx['Bip01 AmmoSem']==nil and world.vfx['Bip01 AmmoSem 1']==nil)
+      world.vfx['Bip01 AmmoDed']==nil and world.vfx['Bip01 AmmoDed 1']==nil)
 world.ammoEquipped=nil
 
 -- player only
@@ -230,26 +231,26 @@ world.equip={}; world.vfx={}
 asNpc(nil,nil,false)
 check('combined is ignored on NPCs, which get standard',
       world.vfx['Bip01 LongBladeOneHand']~=nil
-      and world.vfx['Bip01 LongBladeOneHandSem']==nil)
+      and world.vfx['Bip01 LongBladeOneHandDed']==nil)
 
 -- standard is always the fallback
-world.bones['Bip01 LongBladeOneHandSem']=nil
-world.bones['Bip01 AxeOneHandSem']=nil
+world.bones['Bip01 LongBladeOneHandDed']=nil
+world.bones['Bip01 AxeOneHandDed']=nil
 inv={mk('blade_h',W.LongBladeOneHand), mk('blade_i',W.LongBladeOneHand)}
 world.vfx={}
 asPlayer(nil,nil,false)
-check('combined degrades to standard when the Sem bones are absent',
+check('combined degrades to standard when the Ded bones are absent',
       world.vfx['Bip01 LongBladeOneHand']~=nil)
 
--- the engine's sheathed weapon holds the standard bone; the Sem slot stays open
-world.bones['Bip01 LongBladeOneHandSem']=true
+-- the engine's sheathed weapon holds the standard bone; the Ded slot stays open
+world.bones['Bip01 LongBladeOneHandDed']=true
 local eq=mk('blade_eq',W.LongBladeOneHand)
 inv={eq, mk('blade_j',W.LongBladeOneHand)}
 world.equip={CR=eq}; world.vfx={}; world.doubled=0
 asPlayer(eq,nil,false)
 check('an engine-sheathed weapon blocks only the standard slot',
       world.vfx['Bip01 LongBladeOneHand']==nil
-      and world.vfx['Bip01 LongBladeOneHandSem']~=nil
+      and world.vfx['Bip01 LongBladeOneHandDed']~=nil
       and (world.doubled or 0)==0)
 
 print('perspective switch (the reported bug)')
@@ -305,8 +306,8 @@ print('readiness is transient-only')
 inv={mk('spear1',W.SpearTwoWide)}
 world.equip={}; world.vfx={}
 setCfg{baseSlots='alternative'}
--- The Sem spear bone does not exist; the standard one does.
-world.bones['Bip01 SpearTwoWideSem']=nil
+-- The Ded spear bone does not exist; the standard one does.
+world.bones['Bip01 SpearTwoWideDed']=nil
 world.bones['Bip01 SpearTwoWide']=true
 world.bones['Bip01 AttachShield']=true
 local r1 = common.handler(nil,nil,nil,false,true)

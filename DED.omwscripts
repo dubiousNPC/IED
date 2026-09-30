@@ -1,0 +1,11 @@
+# Dubious Equipment Display
+
+PLAYER: scripts/AnimRefresh/AnimRefresh_v4.lua
+
+MENU:   scripts/SuperSettingsRenderers/SuperSelect3.lua
+
+MENU:   scripts/show-all-weapons/settings.lua
+GLOBAL: scripts/show-all-weapons/global.lua
+
+PLAYER: scripts/show-all-weapons/player.lua
+NPC:    scripts/show-all-weapons/npc.lua
