@@ -1,31 +1,12 @@
 ---@omw-context menu
 
-local I       = require('openmw.interfaces')
-local storage = require('openmw.storage')
+local I          = require('openmw.interfaces')
+local categories = require('scripts.show-all-weapons.categories')
 
--- ---------------------------------------------------------------------------
--- RENDERER DETECTION
--- ---------------------------------------------------------------------------
-
-local MIN_SELECT_VERSION = 3
-
-local function selectRenderer()
-    local installed = storage.playerSection('InstalledSettingsRenderers')
-    if (installed:get('SuperSelect') or 0) >= MIN_SELECT_VERSION then
-        return 'SuperSelect' .. MIN_SELECT_VERSION, true
-    end
-    return 'select', false
-end
-
-local SELECT, HAVE_SUPER = selectRenderer()
-
-local BASE_SLOT_ITEMS = { 'standard', 'alternative', 'combined' }
-
-local baseSlotsArgument = {
-    items = BASE_SLOT_ITEMS,
-    l10n  = 'DED',
-}
-if HAVE_SUPER then baseSlotsArgument.width = 200 end
+-- Requires DropinUtils' multiCheckbox renderer, registered by
+-- scripts/DropinUtils/settingsRenderers/multiCheckbox.lua, which DED.omwscripts
+-- lists BEFORE this file.
+local MULTI_CHECKBOX = 'multiCheckbox_V1'
 
 I.Settings.registerPage({
     key         = 'DED',
@@ -35,21 +16,13 @@ I.Settings.registerPage({
 })
 
 I.Settings.registerGroup({
-    key              = 'Settings_ied_main',
+    key              = 'Settings_DED_main',
     page             = 'DED',
     l10n             = 'DED',
     name             = 'settings_general',
     permanentStorage = true,
     order            = 1,
     settings = {
-        {
-            key         = 'BASESLOTS',
-            name        = 'setting_baseslots',
-            description = 'setting_baseslots_desc',
-            default     = 'standard',
-            renderer    = SELECT,
-            argument    = baseSlotsArgument,
-        },
         {
             key         = 'SHOWNPCS',
             name        = 'setting_shownpcs',
@@ -66,27 +39,6 @@ I.Settings.registerGroup({
             argument    = { min = 0, max = 16384, integer = true },
         },
         {
-            key         = 'SHOWWEAPONS',
-            name        = 'setting_showweapons',
-            description = 'setting_showweapons_desc',
-            default     = true,
-            renderer    = 'checkbox',
-        },
-        {
-            key         = 'SHOWSHIELDS',
-            name        = 'setting_showshields',
-            description = 'setting_showshields_desc',
-            default     = true,
-            renderer    = 'checkbox',
-        },
-        {
-            key         = 'SHOWAMMO',
-            name        = 'setting_showammo',
-            description = 'setting_showammo_desc',
-            default     = true,
-            renderer    = 'checkbox',
-        },
-        {
             key         = 'POLLINTERVAL',
             name        = 'setting_pollinterval',
             description = 'setting_pollinterval_desc',
@@ -95,6 +47,34 @@ I.Settings.registerGroup({
             argument    = { min = 0.1, max = 5.0 },
         },
     },
+})
+
+-- One row per weapon category, each a set of checkboxes. A category only
+-- gets the layer checkboxes it has bones for (see categories.lua).
+local weaponSettings = {}
+for _, id in ipairs(categories.ORDER) do
+    weaponSettings[#weaponSettings + 1] = {
+        key         = categories.settingKey(id),
+        name        = 'cat_' .. id,
+        description = 'cat_' .. id .. '_desc',
+        default     = categories.defaultFor(id),
+        renderer    = MULTI_CHECKBOX,
+        argument    = {
+            l10n = 'DED',
+            keys = categories.flagsFor(id),
+        },
+    }
+end
+
+I.Settings.registerGroup({
+    key              = 'Settings_DED_weapons',
+    page             = 'DED',
+    l10n             = 'DED',
+    name             = 'settings_weapons',
+    description      = 'settings_weapons_desc',
+    permanentStorage = true,
+    order            = 2,
+    settings         = weaponSettings,
 })
 
 return

@@ -87,7 +87,7 @@ local cfg = { showNpcs = true }
 local cfgSubs = {}
 local function setCfg(k, v)
     cfg[k] = v
-    for _, cb in ipairs(cfgSubs) do cb('IED_global', k) end
+    for _, cb in ipairs(cfgSubs) do cb('DED_global', k) end
 end
 package.preload['openmw.storage'] = function() return {
     globalSection = function() return {
@@ -101,6 +101,7 @@ package.preload['openmw.async'] = function() return {
 } end
 package.preload['openmw.interfaces'] = function() return {} end
 package.preload['openmw.nearby'] = function() return { players = { player } } end
+package.preload['scripts.show-all-weapons.categories'] = function() return dofile(DIR .. 'categories.lua') end
 package.preload['scripts.show-all-weapons.bones'] = function() return dofile(DIR .. 'bones.lua') end
 
 local common = dofile(DIR .. 'common.lua')
@@ -222,6 +223,12 @@ check('drawing the weapon still rebuilds', rebuilds > 0, 'addVfx calls=' .. rebu
 rebuilds = 0
 upd3(INTERVAL); upd3(INTERVAL)
 check('nothing changed, nothing rebuilt', rebuilds == 0, 'addVfx calls=' .. rebuilds)
+-- a settings change rebuilds although the inventory did not move
+setCfg('categories', { longBlade = { secondary = true } })
+rebuilds = 0
+upd3(INTERVAL); upd3(INTERVAL)
+check('changing a category checkbox rebuilds', rebuilds > 0, 'addVfx calls=' .. rebuilds)
+setCfg('categories', nil)
 
 -- ---------------------------------------------------------------------------
 print('4. the NPC display toggle still clears and restores')

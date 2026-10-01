@@ -8,6 +8,7 @@ local async   = require('openmw.async')
 local nearby  = require('openmw.nearby')
 local I       = require('openmw.interfaces')
 local bones   = require('scripts.show-all-weapons.bones')
+local categories = require('scripts.show-all-weapons.categories')
 
 local M = {}
 
@@ -34,18 +35,19 @@ local FAR_INTERVAL = 2.0
 -- Without it an NPC pacing on the boundary would rebuild on every check.
 local RANGE_HYSTERESIS = 1.15
 
-local cfg = storage.globalSection('IED_global')
+local cfg = storage.globalSection('DED_global')
 
 -- Mirrored into plain locals and refreshed on change, rather than read live:
 -- these are on the per-frame path for every actor running this handler.
-local cfgCache = {}
+local cfgCache = { cats = {} }
+
+-- Bumped on every settings change. The change detector pushes this single
+-- number instead of every flag, so a settings change always rebuilds and an
+-- unchanged poll still compares one value.
+local cfgVersion = 0
 
 local function refreshCfgCache()
-    cfgCache.showNpcs    = cfg:get('showNpcs')    ~= false
-    cfgCache.baseSlots   = cfg:get('baseSlots')   or 'standard'
-    cfgCache.showWeapons = cfg:get('showWeapons') ~= false
-    cfgCache.showShields = cfg:get('showShields') ~= false
-    cfgCache.showAmmo    = cfg:get('showAmmo')    ~= false
+    cfgCache.showNpcs = cfg:get('showNpcs') ~= false
     local v = cfg:get('pollInterval')
     cfgCache.pollInterval = (type(v) == 'number' and v > 0) and v or POLL_INTERVAL
     local r = cfg:get('npcRange')
@@ -53,13 +55,41 @@ local function refreshCfgCache()
     cfgCache.npcRange  = r
     cfgCache.showDist2 = r * r
     cfgCache.hideDist2 = (r * RANGE_HYSTERESIS) * (r * RANGE_HYSTERESIS)
+
+    -- Missing section, missing category or missing flag all mean the default:
+    -- an unseeded section must behave as the defaults, never as "off".
+    local stored = cfg:get('categories')
+    for _, id in ipairs(categories.ORDER) do
+        local src = type(stored) == 'table' and stored[id] or nil
+        local f = {}
+        for k, d in pairs(categories.DEFAULT_FLAGS) do
+            -- NOT `type(src) == 'table' and src[k] or nil`: that turns a
+            -- stored false into nil, and nil into the default true.
+            local val = nil
+            if type(src) == 'table' then val = src[k] end
+            if val == nil then val = d end
+            f[k] = val == true
+        end
+        -- A layer with no bone cannot be on, whatever was stored.
+        local c = categories.BY_ID[id]
+        if not c.ded then f.secondary = false end
+        if not c.alt then f.alternate = false end
+        cfgCache.cats[id] = f
+    end
+    cfgVersion = cfgVersion + 1
 end
 
 refreshCfgCache()
 cfg:subscribe(async:callback(refreshCfgCache))
 
-local function enabled(key)
-    return cfgCache[key] ~= false
+---Whether a category displays on this actor. The per-category NPC flag only
+---narrows the main NPC toggle, which the update handler checks first.
+---@param id string|nil
+---@param isPlayer boolean|nil
+local function shown(id, isPlayer)
+    local f = id and cfgCache.cats[id]
+    if not f or not f.enabled then return false end
+    return isPlayer or f.npc
 end
 
 local function pollInterval(isPlayer)
@@ -69,8 +99,6 @@ local function pollInterval(isPlayer)
 end
 
 local MAX_AMMO_DISPLAY = 12
-
-local MAX_SHIELDS = 1
 
 local AMMO_TYPES = {
     [types.Weapon.TYPE.Arrow] = true,
@@ -111,17 +139,6 @@ local function armorRecord(item)
     local rec = types.Armor.record(item)
     armorRecCache[rid] = rec or false
     return rec
-end
-
--- ---------------------------------------------------------------------------
--- SKELETON SELECTION
--- ---------------------------------------------------------------------------
----@param isPlayer boolean|nil
----@return string
-local function slotMode(isPlayer)
-    local mode = cfgCache.baseSlots or 'standard'
-    if mode == 'combined' and not isPlayer then return 'standard' end
-    return mode
 end
 
 local function normPath(path)
@@ -260,14 +277,11 @@ end
 
 -- Pushes everything a rebuild depends on. Keep this in step with handler():
 -- if the rebuild starts reading something new, push it here too.
-local function pushState(snap, inv, equippedWeaponId, equippedShieldId, isDrawn, c)
+local function pushState(snap, inv, equippedWeaponId, equippedShieldId, isDrawn, isPlayer)
     snap.push(equippedWeaponId or false)
     snap.push(equippedShieldId or false)
     snap.push(isDrawn)
-    snap.push(c.showWeapons)
-    snap.push(c.showShields)
-    snap.push(c.showAmmo)
-    snap.push(c.baseSlots)
+    snap.push(cfgVersion)
 
     for _, item in ipairs(inv:getAll(types.Weapon)) do
         snap.push(item.recordId)
@@ -279,7 +293,7 @@ local function pushState(snap, inv, equippedWeaponId, equippedShieldId, isDrawn,
     snap.push(false)
     -- Only shields: a cuirass or helm swap cannot change what is drawn, and
     -- used to trigger a full rebuild. Skipped outright when shields are hidden.
-    if c.showShields ~= false then
+    if shown('shield', isPlayer) then
         for _, item in ipairs(inv:getAll(types.Armor)) do
             if isDisplayableShield(armorRecord(item)) then
                 snap.push(item.recordId)
@@ -296,7 +310,6 @@ end
 ---@return boolean ready false when something should have been drawn and the
 ---skeleton had no bone for it
 local function handler(actor, equippedWeapon, equippedShield, isDrawn, isPlayer, inv)
-    local mode = slotMode(isPlayer)
     clearVfx(actor)
 
     local ready = true
@@ -312,6 +325,24 @@ local function handler(actor, equippedWeapon, equippedShield, isDrawn, isPlayer,
         return known
     end
 
+    -- The bones a category may use on THIS skeleton, in fill order. The first
+    -- layer is the Alt bone when asked for and present, else the standard one:
+    -- falling back only when the Alt bone is ABSENT, never when it is merely
+    -- taken, so "alternate" moves the first layer and never adds a slot. The
+    -- second layer is the Ded bone, when asked for.
+    local layerCache = {}
+    local function layers(id)
+        local l = layerCache[id]
+        if l then return l end
+        local c, f = categories.BY_ID[id], cfgCache.cats[id]
+        local first = c.std
+        if f.alternate and usable(c.alt) then first = c.alt end
+        l = { first }
+        if f.secondary then l[2] = c.ded end
+        layerCache[id] = l
+        return l
+    end
+
     inv = inv or types.Actor.inventory(actor)
     local equippedWeaponId = equippedWeapon and equippedWeapon.recordId or nil
     local equippedShieldId = equippedShield and equippedShield.recordId or nil
@@ -321,6 +352,9 @@ local function handler(actor, equippedWeapon, equippedShield, isDrawn, isPlayer,
     local rangedPresent = {}
     local rangedEquipped = {}
 
+    -- An equipped, undrawn weapon is on its STANDARD bone, put there by the
+    -- engine's own sheathing. Claim that bone whatever the layer settings;
+    -- with "alternate" on, the first layer is elsewhere and stays free.
     if equippedWeapon then
         local rec = weaponRecord(equippedWeapon)
         if rec then
@@ -340,16 +374,18 @@ local function handler(actor, equippedWeapon, equippedShield, isDrawn, isPlayer,
         if rec then
             local rid = item.recordId
             local wt  = rec.type
+            local id  = bones.categoryOf(wt)
 
             if AMMO_TYPES[wt] then
-                if enabled('showAmmo') and types.Actor.hasEquipped(actor, item) then
+                if shown(id, isPlayer) and types.Actor.hasEquipped(actor, item) then
                     ammoForRanged[wt] = item
                 end
             else
-                local bone = nil
-                if enabled('showWeapons') and rid ~= equippedWeaponId
-                   and not seen[rid] then
-                    for _, candidate in ipairs(bones.bonesForWeapon(wt, mode)) do
+                if RANGED_TYPES[wt] then rangedPresent[wt] = true end
+
+                if shown(id, isPlayer) and rid ~= equippedWeaponId and not seen[rid] then
+                    local bone = nil
+                    for _, candidate in ipairs(layers(id)) do
                         if usable(candidate) then
                             anyBoneResolved = true
                             if not boneTaken[candidate] then
@@ -358,72 +394,64 @@ local function handler(actor, equippedWeapon, equippedShield, isDrawn, isPlayer,
                             end
                         end
                     end
-                end
 
-                if not bone and enabled('showWeapons') and rid ~= equippedWeaponId
-                   and not seen[rid] then
-                    ready = false
-                end
-
-                if bone then
-                    seen[rid] = true
-                    boneTaken[bone] = true
-                    if RANGED_TYPES[wt] then rangedPresent[wt] = true end
-                    attachVfx(actor, resolveMesh(rec.model), bone, "saw_w_" .. rid)
-                elseif RANGED_TYPES[wt] then
-                    rangedPresent[wt] = true
-                end
-            end
-        end
-    end
-
-    for ammoType, rangedType in pairs(AMMO_FOR_RANGED) do
-        local ammoItem = ammoForRanged[ammoType]
-        if ammoItem and rangedPresent[rangedType]
-           and not (isDrawn and rangedEquipped[rangedType]) then
-            local rec = weaponRecord(ammoItem)
-            if rec then
-                local baseBone = bones.bonesForWeapon(ammoType, mode)[1]
-                local mesh     = normPath(rec.model)
-                if baseBone and mesh then
-                    local count = math.min(inv:countOf(rec.id), MAX_AMMO_DISPLAY)
-                    for i = 1, count do
-                        if not attachVfx(actor, mesh, baseBone .. " " .. i,
-                                         "saw_ammo_" .. ammoType .. "_" .. i) then
-                            break
-                        end
+                    if bone then
+                        seen[rid] = true
+                        boneTaken[bone] = true
+                        attachVfx(actor, resolveMesh(rec.model), bone, "saw_w_" .. rid)
+                    else
+                        ready = false
                     end
                 end
             end
         end
     end
 
-    local shieldsShown = MAX_SHIELDS
-    if enabled('showShields') and not (equippedShield and not isDrawn) then
-        shieldsShown = 0
-    end
-
-    local shieldBone = bones.shieldBone(mode)
-    if usable(shieldBone) then
-        anyBoneResolved = true
-    else
-        shieldBone = bones.SHIELD_BONE
-        if usable(shieldBone) then
-            anyBoneResolved = true
-        else
-            ready = false
+    local quiverBone = categories.BY_ID.quiver.std
+    for ammoType, rangedType in pairs(AMMO_FOR_RANGED) do
+        local ammoItem = ammoForRanged[ammoType]
+        if ammoItem and rangedPresent[rangedType]
+           and not (isDrawn and rangedEquipped[rangedType]) then
+            local rec = weaponRecord(ammoItem)
+            local mesh = rec and normPath(rec.model)
+            if mesh then
+                local count = math.min(inv:countOf(rec.id), MAX_AMMO_DISPLAY)
+                for i = 1, count do
+                    if not attachVfx(actor, mesh, quiverBone .. " " .. i,
+                                     "saw_ammo_" .. ammoType .. "_" .. i) then
+                        break
+                    end
+                end
+            end
         end
     end
-    for _, item in ipairs(inv:getAll(types.Armor)) do
-        if shieldsShown >= MAX_SHIELDS then break end
-        local rid = item.recordId
-        if rid ~= equippedShieldId then
-            local rec = armorRecord(item)
-            if isDisplayableShield(rec) then
-                if attachVfx(actor, normPath(rec.model),
-                             shieldBone,
-                             "saw_sh_" .. shieldsShown) then
-                    shieldsShown = shieldsShown + 1
+
+    -- The standard shield bone doubles as the "is this skeleton up at all"
+    -- probe, so it is checked whether or not shields are shown.
+    local sh = categories.BY_ID.shield
+    local stdShieldUp = usable(sh.std)
+    if stdShieldUp then anyBoneResolved = true else ready = false end
+
+    if shown('shield', isPlayer) then
+        -- First layer: yielded to the engine while an equipped shield is
+        -- sheathed there. Second layer: the Ded bone, when asked for.
+        local slots = {}
+        if stdShieldUp and not (equippedShield and not isDrawn) then
+            slots[#slots + 1] = sh.std
+        end
+        if cfgCache.cats.shield.secondary and usable(sh.ded) then
+            slots[#slots + 1] = sh.ded
+        end
+
+        local n = 0
+        for _, item in ipairs(inv:getAll(types.Armor)) do
+            if n >= #slots then break end
+            if item.recordId ~= equippedShieldId then
+                local rec = armorRecord(item)
+                if isDisplayableShield(rec) then
+                    if attachVfx(actor, normPath(rec.model), slots[n + 1], "saw_sh_" .. n) then
+                        n = n + 1
+                    end
                 end
             end
         end
@@ -466,7 +494,7 @@ function M.makeUpdateHandler(actor, isPlayer)
     local function takeSnapshot()
         local w, s, drawn = readState(actor)
         snap.begin()
-        pushState(snap, inv, w and w.recordId, s and s.recordId, drawn, cfgCache)
+        pushState(snap, inv, w and w.recordId, s and s.recordId, drawn, isPlayer)
         return snap.finish(), w, s, drawn
     end
 

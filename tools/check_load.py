@@ -46,6 +46,11 @@ stub = setmetatable({}, {
     -- out. A checker that hangs is worse than one that misses.
     __index    = function(_, k)
         if type(k) == "number" then return nil end
+        -- A stubbed engine string (`core.getGMST(...)`) walked with
+        -- `for s in str:gmatch(p)` would call the stub as its iterator forever,
+        -- since a call returns the stub and never nil. The engine supplies a
+        -- real string there; an empty iteration lets the chunk finish.
+        if k == "gmatch" then return function() return function() return nil end end end
         return stub
     end,
     __call     = function() return stub end,

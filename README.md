@@ -32,63 +32,49 @@ OpenMW Gearup style mod, display the extra weapons from your inventory. works fo
     * The ammo loop was unbounded and relied on a missing bone to stop it.
 
 
-    # Base slots
+# Weapon settings
 
-```
-Base slots        [ Standard  ▾ ]
-```
+Settings → DED → **Weapons** has one row per weapon category, each with up to
+four checkboxes:
 
-| Option | Bones | Slots per weapon type |
-|---|---|---|
-| **Standard** (default) | the original `_sh` sheathing slots | 1 |
-| **Alternative** | the `_Ded` slots from `DedBones.nif` | 1 |
-| **Combined** | both layers, Standard filled first | **2** |
+| Checkbox | Effect |
+|---|---|
+| **Show** | Display carried weapons of this category at all. |
+| **Secondary set** | Add a second slot on the `Ded` bones (`DedBones.nif`), so two *different* weapons of the category can show. |
+| **Alternate** | Move the first slot from the standard sheath bone to the `Alt` bone (`xbase_anim_ded2.nif`). It moves the slot, it does not add one. |
+| **NPCs** | Also show this category on NPCs. Only works while **NPCs display carried gear** is on. |
 
-## Combined
+A category only offers the checkboxes it has bones for: spears have no Ded bone
+(no secondary set), shields have no Alt bone (no alternate), and the quiver has
+neither.
 
-Standard is the first layer; the `_Ded` bones add **one extra slot per weapon
-type** on top. Two different long blades show two swords — one where the engine
-would sheathe it, one on the Ded rig. A third has nowhere to go.
-
-Three deliberate limits:
-
-- **No second shield, no second quiver.** Arrow and Bolt have no `_Ded`
-  override, so `bonesForWeapon` returns a single candidate for them under every
-  mode — the quiver cannot double even in principle. The shield is explicitly
-  one bone per mode, and under Combined it uses the **Standard** bone, since a
-  lone shield belongs on the layer the engine itself would use.
-- **Player only.** An NPC asked for Combined gets Standard. Doubling every
-  actor's attachments across a cell is precisely the cost this mod exists to
-  avoid.
-- **One attachment per distinct record.** The vfx tag is derived from the record
-  id, and two attachments sharing a tag remove each other. Two of the *same*
-  sword therefore fill one slot; two *different* swords fill both. Say if you
-  want stacks to fill both slots — it needs per-copy tags, which is a small but
-  real change.
+Defaults are the old "Standard" behaviour: every category shown, standard bones
+only, on the player and NPCs.
 
 ## Standard is always the fallback
 
-Checked per **bone**, not per actor. `bonesForWeapon` returns the fallback as a
-later candidate and the caller tests each one against that actor's own skeleton
-before taking it, so a skeleton carrying some `_Ded` bones and not others still
-works — each type independently uses whichever layer it actually has.
-
-This replaced a per-actor `hasBone` probe. The probe answered "does this actor
-have the Ded rig", which is the wrong granularity: one missing bone made the
-whole actor fall back, and a partially-merged skeleton silently showed nothing
-for the types it did have. Attaching to a bone that is not there is a **silent**
-no-show, so every candidate is verified before use. The check is memoized per
-rebuild, since a lookup is real work and a mode can offer the same bone twice.
-
-The shield does the same: if the Ded shield bone is missing, it falls back to
-`Bip01 AttachShield` rather than not drawing.
+Checked per **bone**, not per actor. If Alternate is on but the actor's skeleton
+lacks that Alt bone, the first slot falls back to the standard bone rather than
+showing nothing. It falls back only when the Alt bone is *absent*, never when it
+is merely taken, so Alternate can never add a slot.
 
 ## Interaction with the engine's own sheathing
 
-An equipped, undrawn weapon is on the **Standard** bone, put there by OpenMW's
-weapon sheathing. Only that bone is claimed — under Combined the Ded slot for
-that type stays open and takes a carried weapon. Drawn, the standard bone frees
-up again.
+An equipped, undrawn weapon is on the **standard** bone, put there by OpenMW's
+weapon sheathing. That bone is claimed, so nothing stacks on it. With Secondary
+set on, a carried weapon of the same category still shows on the Ded bone; with
+Alternate on, it shows on the Alt bone. Shields work the same way: with an
+equipped shield sheathed, a carried one can show on the Ded shield bone.
+
+One attachment per distinct record: two of the *same* sword fill one slot, two
+*different* swords fill both.
+
+## Requirements
+
+The Weapons rows use the multiCheckbox renderer from
+[Bor's Drop-in Utils](https://github.com/OpenMW-Mod-Collection/DropinUtils),
+bundled under `scripts/DropinUtils/` and registered ahead of the settings page
+in `DED.omwscripts`.
 
 ## NPC display range
 

@@ -1,17 +1,21 @@
 ---@omw-context global
 
-local storage = require('openmw.storage')
+local storage    = require('openmw.storage')
+local categories = require('scripts.show-all-weapons.categories')
 
 local state = storage.globalSection('DED_global')
 
+local function defaultCategories()
+    local out = {}
+    for _, id in ipairs(categories.ORDER) do out[id] = categories.defaultFor(id) end
+    return out
+end
+
 local DEFAULTS = {
     showNpcs     = true,
-    baseSlots    = 'standard',
-    showWeapons  = true,
-    showShields  = true,
-    showAmmo     = true,
     pollInterval = 0.5,
     npcRange     = 3072,
+    categories   = defaultCategories(),
 }
 
 local function seed()
