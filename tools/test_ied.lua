@@ -59,31 +59,46 @@ package.preload['openmw.animation']=function() return {
 -- get and subscribe, and a way to fire the callback when world.cfg changes.
 local cfgSubs={}
 package.preload['openmw.storage']=function() return {
-    globalSection=function() return {
-        get=function(_,k) return world.cfg[k] end,
-        subscribe=function(_,cb) cfgSubs[#cfgSubs+1]=cb end,
-    } end } end
+    globalSection=function()
+        return dofile('tools/mock_storage.lua').section(function() return world.cfg end, cfgSubs)
+    end } end
 package.preload['openmw.async']=function() return {
     callback=function(_,f) return f end,
     newUnsavableSimulationTimer=function(_,_,f) f() end } end
 package.preload['openmw.interfaces']=function() return {} end
+package.preload['openmw.nearby']=function() return { players = {} } end
+package.preload['scripts.show-all-weapons.categories']=function() return dofile(DIR..'categories.lua') end
 package.preload['scripts.show-all-weapons.bones']=function() return dofile(DIR..'bones.lua') end
 
 local bones=dofile(DIR..'bones.lua')
+local categories=dofile(DIR..'categories.lua')
 local common=dofile(DIR..'common.lua')
 
 -- Settings are cached, not read live, so the test must push a change the same
 -- way the engine would rather than mutating world.cfg silently.
 local function setCfg(t)
     world.cfg=t
-    for _,cb in ipairs(cfgSubs) do cb('IED_global', nil) end
+    for _,cb in ipairs(cfgSubs) do cb('DED_global', nil) end
 end
 
-print('bones.lua')
-local shared=bones.sharedBones()
-check('shared bones are computed, not listed',
-      shared['Bip01 LongBladeOneHand']==true and shared['Bip01 Ammo']==true)
-check('unshared bones are not flagged', shared['Bip01 ShortBladeOneHand']==nil)
+print('bones.lua / categories.lua')
+check('one-hand axes map to their own category', bones.categoryOf(W.AxeOneHand)=='axe')
+check('arrows and bolts share the quiver category',
+      bones.categoryOf(W.Arrow)=='quiver' and bones.categoryOf(W.Bolt)=='quiver')
+check('axes still sheathe on the standard long blade bone',
+      bones.standardBone(W.AxeOneHand)=='Bip01 LongBladeOneHand')
+local function has(t,v) for _,x in ipairs(t) do if x==v then return true end end return false end
+check('a full category offers all four checkboxes',
+      #categories.flagsFor('longBlade')==4)
+check('spears offer no secondary set (no SpearTwoWideDed)',
+      not has(categories.flagsFor('spear'),'secondary') and has(categories.flagsFor('spear'),'alternate'))
+check('shields offer no alternate (no AttachShieldAlt)',
+      not has(categories.flagsFor('shield'),'alternate') and has(categories.flagsFor('shield'),'secondary'))
+check('the quiver offers only show and NPCs',
+      #categories.flagsFor('quiver')==2)
+check('every category is mapped and ordered', (function()
+    for _,id in ipairs(categories.ORDER) do if not categories.BY_ID[id] then return false end end
+    return #categories.ORDER==14 end)())
 
 for _,b in pairs({'Bip01 LongBladeOneHand','Bip01 ShortBladeOneHand','Bip01 AttachShield',
                   'Bip01 AxeTwoClose','Bip01 MarksmanBow','Bip01 AttachWeapon'}) do
@@ -130,127 +145,138 @@ check('with the shield drawn the back is free again',
       world.vfx['Bip01 AttachShield']~=nil)
 
 print('settings')
-inv={mk('ls3',W.LongBladeOneHand)}
-world.equip={}; world.vfx={}; setCfg{showWeapons=false}
-common.handler(nil,nil,nil,false)
-check('showWeapons=false hides carried weapons', next(world.vfx)==nil)
+-- handler's 5th arg is isPlayer.
+local function asPlayer(w,sh,drawn) return common.handler(nil,w,sh,drawn,true) end
+local function asNpc(w,sh,drawn)    return common.handler(nil,w,sh,drawn,nil)  end
+local function count(prefix) local n=0 for _,v in pairs(world.vfx) do if tostring(v):find(prefix,1,true) then n=n+1 end end return n end
+
+inv={mk('ls3',W.LongBladeOneHand), mk('sb3',W.ShortBladeOneHand)}
+world.equip={}; world.vfx={}
+setCfg{categories={longBlade={enabled=false}}}
+asPlayer(nil,nil,false)
+check('a disabled category hides only that category',
+      world.vfx['Bip01 LongBladeOneHand']==nil and world.vfx['Bip01 ShortBladeOneHand']~=nil)
 setCfg{}
 world.vfx={}
-common.handler(nil,nil,nil,false)
-check('absent config behaves as enabled, not disabled', next(world.vfx)~=nil)
-
-print('base slots')
--- handler's 5th arg is isPlayer; combined is player-only.
-local function asPlayer(w,sh,drawn) common.handler(nil,w,sh,drawn,true) end
-local function asNpc(w,sh,drawn)    common.handler(nil,w,sh,drawn,nil)  end
--- Standard must never use Sem bones, even on a skeleton that has them.
-world.bones['Bip01 LongBladeOneHandSem']=true
-world.bones['Bip01 AxeOneHandSem']=true
-inv={mk('ls9',W.LongBladeOneHand)}; world.equip={}; world.vfx={}
-setCfg{baseSlots='standard'}
-common.handler(nil,nil,nil,false)
-check('standard uses the original _sh slot',
-      world.vfx['Bip01 LongBladeOneHand']~=nil and world.vfx['Bip01 LongBladeOneHandSem']==nil)
-
-world.vfx={}; setCfg{baseSlots='alternative'}
-common.handler(nil,nil,nil,false)
-check('alternative uses the _Sem slot',
-      world.vfx['Bip01 LongBladeOneHandSem']~=nil and world.vfx['Bip01 LongBladeOneHand']==nil)
-
--- On Sem, axes get their own bone, so the standard collision disappears.
-inv={mk('ls10',W.LongBladeOneHand), mk('axe10',W.AxeOneHand)}
-world.vfx={}; world.doubled=0
-common.handler(nil,nil,nil,false)
-check('alternative gives axes their own bone, so no collision',
-      world.vfx['Bip01 LongBladeOneHandSem']~=nil
-      and world.vfx['Bip01 AxeOneHandSem']~=nil and (world.doubled or 0)==0)
-
--- A skeleton without the Sem bones must fall back, not show nothing.
-world.bones['Bip01 LongBladeOneHandSem']=nil
-world.bones['Bip01 AxeOneHandSem']=nil
-inv={mk('ls11',W.LongBladeOneHand)}; world.vfx={}
-setCfg{baseSlots='alternative'}
-common.handler(nil,nil,nil,false)
-check('alternative falls back to standard when the Sem bones are absent',
-      world.vfx['Bip01 LongBladeOneHand']~=nil,
-      'a missing bone is a SILENT no-show, so this must be checked')
-
--- unset config must not break
-world.vfx={}; setCfg{}
-common.handler(nil,nil,nil,false)
-check('unset baseSlots behaves as standard', world.vfx['Bip01 LongBladeOneHand']~=nil)
-
-print('combined mode')
-world.bones['Bip01 LongBladeOneHandSem']=true
-world.bones['Bip01 AxeOneHandSem']=true
-world.bones['Bip01 AttachShieldSem']=true
-
--- two DIFFERENT long blades: standard takes the first, Sem the second
-inv={mk('blade_a',W.LongBladeOneHand), mk('blade_b',W.LongBladeOneHand)}
-world.equip={}; world.vfx={}; world.doubled=0
-setCfg{baseSlots='combined'}
 asPlayer(nil,nil,false)
-check('combined fills the standard slot AND the Sem slot',
-      world.vfx['Bip01 LongBladeOneHand']~=nil
-      and world.vfx['Bip01 LongBladeOneHandSem']~=nil
+check('absent config behaves as enabled, not disabled', world.vfx['Bip01 LongBladeOneHand']~=nil)
+
+setCfg{categories={longBlade={npc=false}}}
+world.vfx={}; asNpc(nil,nil,false)
+check('NPCs flag off: the category is hidden on NPCs',
+      world.vfx['Bip01 LongBladeOneHand']==nil and world.vfx['Bip01 ShortBladeOneHand']~=nil)
+world.vfx={}; asPlayer(nil,nil,false)
+check('NPCs flag off: the player still shows it', world.vfx['Bip01 LongBladeOneHand']~=nil)
+
+print('layers')
+for _,b in ipairs({'Bip01 LongBladeOneHandDed','Bip01 LongBladeOneHandAlt',
+                   'Bip01 AxeOneHandDed','Bip01 AxeOneHandAlt'}) do world.bones[b]=true end
+
+inv={mk('ls9',W.LongBladeOneHand)}; world.equip={}; world.vfx={}
+setCfg{}
+asPlayer(nil,nil,false)
+check('defaults use the standard bone only, even on a skeleton with Ded and Alt',
+      world.vfx['Bip01 LongBladeOneHand']~=nil and world.vfx['Bip01 LongBladeOneHandDed']==nil
+      and world.vfx['Bip01 LongBladeOneHandAlt']==nil)
+
+world.vfx={}; setCfg{categories={longBlade={alternate=true}}}
+asPlayer(nil,nil,false)
+check('alternate moves the first layer to the Alt bone',
+      world.vfx['Bip01 LongBladeOneHandAlt']~=nil and world.vfx['Bip01 LongBladeOneHand']==nil)
+
+inv={mk('la',W.LongBladeOneHand), mk('lb',W.LongBladeOneHand)}; world.vfx={}
+asPlayer(nil,nil,false)
+check('alternate does not add a slot: a second blade has nowhere to go', count('saw_w_')==1, count('saw_w_'))
+
+world.bones['Bip01 LongBladeOneHandAlt']=nil
+inv={mk('ls11',W.LongBladeOneHand)}; world.vfx={}
+asPlayer(nil,nil,false)
+check('alternate falls back to standard when the Alt bone is absent',
+      world.vfx['Bip01 LongBladeOneHand']~=nil, 'a missing bone is a SILENT no-show')
+world.bones['Bip01 LongBladeOneHandAlt']=true
+
+inv={mk('blade_a',W.LongBladeOneHand), mk('blade_b',W.LongBladeOneHand), mk('blade_c',W.LongBladeOneHand)}
+world.vfx={}; world.doubled=0; setCfg{categories={longBlade={secondary=true}}}
+asPlayer(nil,nil,false)
+check('secondary fills the standard slot AND the Ded slot, and no third',
+      world.vfx['Bip01 LongBladeOneHand']~=nil and world.vfx['Bip01 LongBladeOneHandDed']~=nil
+      and count('saw_w_')==2 and (world.doubled or 0)==0, count('saw_w_'))
+
+world.vfx={}; setCfg{categories={longBlade={secondary=true, alternate=true}}}
+asPlayer(nil,nil,false)
+check('alternate + secondary: Alt then Ded, standard left alone',
+      world.vfx['Bip01 LongBladeOneHandAlt']~=nil and world.vfx['Bip01 LongBladeOneHandDed']~=nil
+      and world.vfx['Bip01 LongBladeOneHand']==nil)
+
+inv={mk('ls10',W.LongBladeOneHand), mk('axe10',W.AxeOneHand)}
+world.vfx={}; world.doubled=0; setCfg{categories={axe={alternate=true}}}
+asPlayer(nil,nil,false)
+check('alternate axes get their own bone, so no collision with the long blade',
+      world.vfx['Bip01 LongBladeOneHand']=='saw_w_ls10' and world.vfx['Bip01 AxeOneHandAlt']=='saw_w_axe10'
       and (world.doubled or 0)==0)
 
--- a third has nowhere to go
-inv={mk('blade_c',W.LongBladeOneHand), mk('blade_d',W.LongBladeOneHand),
-     mk('blade_e',W.LongBladeOneHand)}
-world.vfx={}; world.doubled=0
-asPlayer(nil,nil,false)
-local n=0; for _ in pairs(world.vfx) do n=n+1 end
-check('combined adds exactly one extra slot, not unlimited', n==2 and (world.doubled or 0)==0, n)
-
--- NO second shield
-local sa=mk('sh_a'); recs['sh_a'].type=ArmorT.TYPE.Shield; recs['sh_a'].armor=true
-local sb=mk('sh_b'); recs['sh_b'].type=ArmorT.TYPE.Shield; recs['sh_b'].armor=true
-inv={sa,sb}; world.equip={}; world.vfx={}
-asPlayer(nil,nil,false)
-local shields=0
-for _,v in pairs(world.vfx) do if tostring(v):find('saw_sh_') then shields=shields+1 end end
-check('combined does NOT add a second shield', shields==1, shields)
-check('combined puts the shield on the STANDARD bone',
-      world.vfx['Bip01 AttachShield']~=nil and world.vfx['Bip01 AttachShieldSem']==nil)
-
--- NO second quiver: Arrow has no Sem override
-world.bones['Bip01 Ammo 1']=true; world.bones['Bip01 Ammo 2']=true
-local bow=mk('bow1',W.MarksmanBow); local arrow=mk('arrow1',W.Arrow)
-inv={bow,arrow}; world.equip={}; world.ammoEquipped=arrow
-world.vfx={}
-asPlayer(nil,nil,false)
-check('combined does NOT add a second quiver bone',
-      world.vfx['Bip01 AmmoSem']==nil and world.vfx['Bip01 AmmoSem 1']==nil)
-world.ammoEquipped=nil
-
--- player only
-inv={mk('blade_f',W.LongBladeOneHand), mk('blade_g',W.LongBladeOneHand)}
-world.equip={}; world.vfx={}
-asNpc(nil,nil,false)
-check('combined is ignored on NPCs, which get standard',
-      world.vfx['Bip01 LongBladeOneHand']~=nil
-      and world.vfx['Bip01 LongBladeOneHandSem']==nil)
-
--- standard is always the fallback
-world.bones['Bip01 LongBladeOneHandSem']=nil
-world.bones['Bip01 AxeOneHandSem']=nil
-inv={mk('blade_h',W.LongBladeOneHand), mk('blade_i',W.LongBladeOneHand)}
-world.vfx={}
-asPlayer(nil,nil,false)
-check('combined degrades to standard when the Sem bones are absent',
-      world.vfx['Bip01 LongBladeOneHand']~=nil)
-
--- the engine's sheathed weapon holds the standard bone; the Sem slot stays open
-world.bones['Bip01 LongBladeOneHandSem']=true
 local eq=mk('blade_eq',W.LongBladeOneHand)
 inv={eq, mk('blade_j',W.LongBladeOneHand)}
 world.equip={CR=eq}; world.vfx={}; world.doubled=0
+setCfg{categories={longBlade={secondary=true}}}
 asPlayer(eq,nil,false)
 check('an engine-sheathed weapon blocks only the standard slot',
-      world.vfx['Bip01 LongBladeOneHand']==nil
-      and world.vfx['Bip01 LongBladeOneHandSem']~=nil
-      and (world.doubled or 0)==0)
+      world.vfx['Bip01 LongBladeOneHand']==nil and world.vfx['Bip01 LongBladeOneHandDed']~=nil)
+world.vfx={}; setCfg{categories={longBlade={alternate=true}}}
+asPlayer(eq,nil,false)
+check('with alternate, a carried blade sits on Alt beside the engine-sheathed one',
+      world.vfx['Bip01 LongBladeOneHandAlt']=='saw_w_blade_j')
+world.equip={}
+
+inv={mk('blade_f',W.LongBladeOneHand), mk('blade_g',W.LongBladeOneHand)}
+world.vfx={}; setCfg{categories={longBlade={secondary=true}}}
+asNpc(nil,nil,false)
+check('layer flags apply to NPCs too', count('saw_w_')==2, count('saw_w_'))
+
+world.bones['Bip01 SpearTwoWide']=true; world.bones['Bip01 SpearTwoWideDed']=true
+inv={mk('sp1',W.SpearTwoWide), mk('sp2',W.SpearTwoWide)}; world.vfx={}
+setCfg{categories={spear={secondary=true}}}
+asPlayer(nil,nil,false)
+check('a stored flag for a layer the category lacks is ignored',
+      count('saw_w_')==1 and world.vfx['Bip01 SpearTwoWideDed']==nil)
+world.bones['Bip01 SpearTwoWideDed']=nil
+
+print('shields')
+world.bones['Bip01 AttachShieldDed']=true
+local sa=mk('sh_a'); recs['sh_a'].type=ArmorT.TYPE.Shield; recs['sh_a'].armor=true
+local sb=mk('sh_b'); recs['sh_b'].type=ArmorT.TYPE.Shield; recs['sh_b'].armor=true
+local sc=mk('sh_c'); recs['sh_c'].type=ArmorT.TYPE.Shield; recs['sh_c'].armor=true
+inv={sa,sb,sc}; world.equip={}; world.vfx={}; setCfg{}
+asPlayer(nil,nil,false)
+check('by default one shield, on the standard bone',
+      count('saw_sh_')==1 and world.vfx['Bip01 AttachShield']~=nil)
+world.vfx={}; setCfg{categories={shield={secondary=true}}}
+asPlayer(nil,nil,false)
+check('secondary adds exactly one more shield, on the Ded bone',
+      count('saw_sh_')==2 and world.vfx['Bip01 AttachShieldDed']~=nil)
+world.equip={CL=sa}; world.vfx={}
+asPlayer(nil,sa,false)
+check('equipped shield sheathed: a carried one still shows on Ded',
+      world.vfx['Bip01 AttachShield']==nil and world.vfx['Bip01 AttachShieldDed']~=nil)
+world.equip={}
+world.vfx={}; setCfg{categories={shield={enabled=false}}}
+asPlayer(nil,nil,false)
+check('shields disabled: none shown', count('saw_sh_')==0)
+
+print('quiver')
+world.bones['Bip01 Ammo 1']=true; world.bones['Bip01 Ammo 2']=true
+local bow=mk('bow1',W.MarksmanBow); local arrow=mk('arrow1',W.Arrow); arrow.count=5
+world.bones['Bip01 MarksmanBow']=true
+inv={bow,arrow}; world.equip={}; world.ammoEquipped=arrow
+world.vfx={}; setCfg{}
+asPlayer(nil,nil,false)
+check('the quiver shows with a carried bow', count('saw_ammo_')==2, count('saw_ammo_'))
+world.vfx={}; setCfg{categories={quiver={enabled=false}}}
+asPlayer(nil,nil,false)
+check('quiver disabled: no arrows, bow still shown',
+      count('saw_ammo_')==0 and world.vfx['Bip01 MarksmanBow']~=nil)
+world.ammoEquipped=nil
+setCfg{}
 
 print('perspective switch (the reported bug)')
 -- Reproduce it exactly: subscribe through the real interface, then fire the
@@ -304,9 +330,9 @@ print('readiness is transient-only')
 -- every perspective change, forever.
 inv={mk('spear1',W.SpearTwoWide)}
 world.equip={}; world.vfx={}
-setCfg{baseSlots='alternative'}
--- The Sem spear bone does not exist; the standard one does.
-world.bones['Bip01 SpearTwoWideSem']=nil
+setCfg{categories={spear={alternate=true}}}
+-- The Alt spear bone is absent from this skeleton; the standard one exists.
+world.bones['Bip01 SpearTwoWideAlt']=nil
 world.bones['Bip01 SpearTwoWide']=true
 world.bones['Bip01 AttachShield']=true
 local r1 = common.handler(nil,nil,nil,false,true)
