@@ -6,13 +6,6 @@ bin-release/
 
 # Other files and folders
 .settings/
-ANIMREFRESH_REVIEW.md
-ASSESSMENT.md
-BASESLOTS.md
-RESEARCH.md
-SWEEP.md
-SWEEP_REPORT.md
-VERSION.md
 
 # Executables
 *.swf
