@@ -49,6 +49,8 @@ I.Settings.registerGroup({
     },
 })
 
+-- One row per weapon category, each a set of checkboxes. A category only
+-- gets the layer checkboxes it has bones for (see categories.lua).
 local weaponSettings = {}
 for _, id in ipairs(categories.ORDER) do
     weaponSettings[#weaponSettings + 1] = {

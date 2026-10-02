@@ -59,10 +59,9 @@ package.preload['openmw.animation']=function() return {
 -- get and subscribe, and a way to fire the callback when world.cfg changes.
 local cfgSubs={}
 package.preload['openmw.storage']=function() return {
-    globalSection=function() return {
-        get=function(_,k) return world.cfg[k] end,
-        subscribe=function(_,cb) cfgSubs[#cfgSubs+1]=cb end,
-    } end } end
+    globalSection=function()
+        return dofile('tools/mock_storage.lua').section(function() return world.cfg end, cfgSubs)
+    end } end
 package.preload['openmw.async']=function() return {
     callback=function(_,f) return f end,
     newUnsavableSimulationTimer=function(_,_,f) f() end } end

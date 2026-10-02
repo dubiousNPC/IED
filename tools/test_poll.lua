@@ -90,10 +90,9 @@ local function setCfg(k, v)
     for _, cb in ipairs(cfgSubs) do cb('DED_global', k) end
 end
 package.preload['openmw.storage'] = function() return {
-    globalSection = function() return {
-        get = function(_, k) return cfg[k] end,
-        subscribe = function(_, cb) cfgSubs[#cfgSubs + 1] = cb end,
-    } end,
+    globalSection = function()
+        return dofile('tools/mock_storage.lua').section(function() return cfg end, cfgSubs)
+    end,
 } end
 package.preload['openmw.async'] = function() return {
     callback = function(_, f) return f end,

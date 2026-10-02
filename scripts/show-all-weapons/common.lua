@@ -58,7 +58,14 @@ local function refreshCfgCache()
 
     -- Missing section, missing category or missing flag all mean the default:
     -- an unseeded section must behave as the defaults, never as "off".
-    local stored = cfg:get('categories')
+    --
+    -- getCopy, NOT get. get() returns a table value read-only, and the engine's
+    -- read-only wrapper is a USERDATA (makeReadOnly, components/lua/
+    -- luastate.cpp), nested tables included. `type(stored) == 'table'` was
+    -- therefore always false in game and every actor ran on the defaults,
+    -- whatever the settings said. A copy is a plain table; this runs only when
+    -- a setting changes, so the allocation is irrelevant.
+    local stored = cfg:getCopy('categories')
     for _, id in ipairs(categories.ORDER) do
         local src = type(stored) == 'table' and stored[id] or nil
         local f = {}

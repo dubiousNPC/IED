@@ -63,8 +63,9 @@ package.preload['openmw.animation']=function() return {
   removeVfx=function(_,id) for b,v in pairs(world.vfx) do if v==id then world.vfx[b]=nil end end end,
   hasBone=function(_,b) return world.bones[b]==true end} end
 package.preload['openmw.storage']=function() return {
-  globalSection=function() return {get=function(_,k) return world.cfg[k] end,
-                                   subscribe=function() end} end} end
+  globalSection=function()
+      return dofile('tools/mock_storage.lua').section(function() return world.cfg end, nil)
+  end} end
 
 -- The engine's interfaces table is populated progressively as scripts load, so
 -- model it as a live table: AnimRefresh loads first and writes into it, then
