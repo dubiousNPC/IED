@@ -94,9 +94,15 @@ package.preload['openmw.storage'] = function() return {
         return dofile('tools/mock_storage.lua').section(function() return cfg end, cfgSubs)
     end,
 } end
+-- Polling is a self-re-arming simulation timer now, so a mock that fires the
+-- callback inline is infinite recursion. mock_timers queues against a
+-- simulated clock and swaps `current` back to whichever actor armed the entry
+-- before firing it, which is the per-script sandbox the engine gives each one.
+local T = dofile('tools/mock_timers.lua').new(function() return current end,
+                                              function(a) current = a end)
 package.preload['openmw.async'] = function() return {
     callback = function(_, f) return f end,
-    newUnsavableSimulationTimer = function(_, _, f) f() end,
+    newUnsavableSimulationTimer = function(_, d, f) T.add(d, f) end,
 } end
 package.preload['openmw.interfaces'] = function() return {} end
 package.preload['openmw.nearby'] = function() return { players = { player } } end
@@ -126,26 +132,42 @@ end
 local DT = 1 / 60
 local INTERVAL = 1.0     -- NPC cadence: 0.5s player interval x NPC_INTERVAL_MULT 2
 local FAR = 2.0
+local OFF = 3.0          -- OFF_INTERVAL: the cadence of an NPC with display off
+local FULL = INTERVAL * 4 -- one FULL_SCAN_MULT cycle, i.e. long enough that the
+                          -- expensive inventory walk is guaranteed to have run
 
 -- ---------------------------------------------------------------------------
 print('1. NPCs activated together are spread across the poll interval')
 math.randomseed(1234)
 local N = 40
-local actors, updates = {}, {}
+local actors, handlers = {}, {}
+local pollsAtStart = stats.polls
 for i = 1, N do
     actors[i] = newActor(); guardInventory(actors[i])
     current = actors[i]
-    updates[i] = common.makeUpdateHandler(actors[i], nil)
+    handlers[i] = common.makeUpdateHandler(actors[i], nil)
+    -- onActive is what arms this actor's chain, and the stagger lives in the
+    -- delay it picks: every NPC in a cell activates on the same frame, so
+    -- without it the whole cell would share one poll frame forever.
+    handlers[i].onActive()
 end
+-- Counted around the activation loop above, because that is where the forced
+-- first build happens: onActive services the actor synchronously and only then
+-- arms the staggered chain. Measuring it on the first advanced frame instead
+-- would be measuring the stagger, which is a different property (checked
+-- below) and would read as a pop-in that is not there.
+local buildsOnActivation = stats.polls - pollsAtStart
 local pollsPerFrame = {}
 local frames = math.floor(5 / DT)
 for f = 1, frames do
     local before = stats.polls
-    for i = 1, N do current = actors[i]; updates[i](DT) end
+    -- One clock step drives all 40 chains; there is no per-actor call to make.
+    T.advance(DT)
     pollsPerFrame[f] = stats.polls - before
 end
--- Skip the first second: frame 1 is the forced first build for everyone,
--- which is intended (gear appears immediately on cell load).
+-- Skip the first second: every actor's first poll lands somewhere inside that
+-- window, because that is the interval onActive staggers across. What follows
+-- is the steady state, where each chain re-arms exactly one interval on.
 local worst, total = 0, 0
 local steadyFrames = 0
 for f = math.floor(1 / DT) + 1, frames do
@@ -156,21 +178,28 @@ end
 local ideal = N * DT / INTERVAL
 print(string.format('     %d NPCs, %.1fs interval: worst frame %d polls, mean %.2f (even spread ~%.2f)',
     N, INTERVAL, worst, total / steadyFrames, ideal))
-check('first frame builds every NPC (no pop-in delay)', pollsPerFrame[1] == N, pollsPerFrame[1])
+check('activation builds every NPC (no pop-in delay)', buildsOnActivation == N,
+      'builds=' .. buildsOnActivation)
 check('steady state: no frame carries more than a quarter of the NPCs', worst <= N / 4,
       'worst=' .. worst)
 
 -- ---------------------------------------------------------------------------
 print('2. an unchanged poll allocates almost nothing')
+-- Section 1's 40 chains are still queued and would poll on every clock step
+-- here, so retire them: only this actor's allocations are being measured.
+T.clear()
 local a = newActor(); guardInventory(a); current = a
-local upd = common.makeUpdateHandler(a, nil)
-upd(DT)                                 -- forced first build
-for _ = 1, 200 do upd(DT) end           -- settle, prime record caches
+local h2 = common.makeUpdateHandler(a, nil)
+h2.onActive()
+T.advance(INTERVAL)                     -- forced first build (staggered, so a
+                                        -- whole interval is what reaches it)
+T.run(200 * DT, DT)                     -- settle, prime record caches
 collectgarbage('collect'); collectgarbage('stop')
 local polls0 = stats.polls
 local kb0 = collectgarbage('count')
 local t = 0
-while stats.polls - polls0 < 1000 do upd(INTERVAL) ; t = t + 1 end
+-- One interval of clock per step is exactly one poll on this actor's chain.
+while stats.polls - polls0 < 1000 do T.advance(INTERVAL) ; t = t + 1 end
 local kb = collectgarbage('count') - kb0
 collectgarbage('restart')
 -- The mock's getAll/getEquipment return fresh tables like the engine does;
@@ -195,37 +224,43 @@ local rebuilds = 0
 local anim = require('openmw.animation')
 anim.removeVfx = function() end
 anim.addVfx = function() rebuilds = rebuilds + 1 end
+T.clear()
 local b = newActor(); guardInventory(b); current = b
-local upd3 = common.makeUpdateHandler(b, nil)
-upd3(DT)
+local h3 = common.makeUpdateHandler(b, nil)
+h3.onActive()
+T.advance(INTERVAL)                     -- forced first build
+-- Each change below is driven with one FULL_SCAN_MULT cycle of clock rather
+-- than a couple of polls: the inventory changes land in the expensive tier,
+-- which runs once per FULL_SCAN_MULT polls, and the point of each check is
+-- whether the change is ever noticed -- not how soon.
 rebuilds = 0
 -- swap cuirass: not displayed by IED
 b.inv[6] = item('cuirass2')
-upd3(INTERVAL); upd3(INTERVAL)
+T.run(FULL)
 check('swapping a cuirass does not rebuild', rebuilds == 0, 'addVfx calls=' .. rebuilds)
 -- picking up a second shield: displayed candidate, must be seen
 rebuilds = 0
 b.inv[#b.inv + 1] = item('shield_b')
-upd3(INTERVAL); upd3(INTERVAL)
+T.run(FULL)
 check('picking up a shield does rebuild', rebuilds > 0, 'addVfx calls=' .. rebuilds)
 -- weapon count change (arrows fired) must still be seen: quiver display
 rebuilds = 0
 b.inv[4] = item('arrow', 12)
-upd3(INTERVAL); upd3(INTERVAL)
+T.run(FULL)
 check('arrow count change still rebuilds', rebuilds > 0, 'addVfx calls=' .. rebuilds)
 -- drawing the weapon must still be seen
 rebuilds = 0
 b.stance = 1
-upd3(INTERVAL); upd3(INTERVAL)
+T.run(FULL)
 check('drawing the weapon still rebuilds', rebuilds > 0, 'addVfx calls=' .. rebuilds)
 -- no change at all: nothing
 rebuilds = 0
-upd3(INTERVAL); upd3(INTERVAL)
+T.run(FULL)
 check('nothing changed, nothing rebuilt', rebuilds == 0, 'addVfx calls=' .. rebuilds)
 -- a settings change rebuilds although the inventory did not move
 setCfg('categories', { longBlade = { secondary = true } })
 rebuilds = 0
-upd3(INTERVAL); upd3(INTERVAL)
+T.run(FULL)
 check('changing a category checkbox rebuilds', rebuilds > 0, 'addVfx calls=' .. rebuilds)
 setCfg('categories', nil)
 
@@ -233,18 +268,23 @@ setCfg('categories', nil)
 print('4. the NPC display toggle still clears and restores')
 local cleared = 0
 anim.removeVfx = function() cleared = cleared + 1 end
+T.clear()
 local c = newActor(); guardInventory(c); current = c
-local upd4 = common.makeUpdateHandler(c, nil)
-upd4(DT)
+local h4 = common.makeUpdateHandler(c, nil)
+h4.onActive()
+T.advance(INTERVAL)                     -- forced first build
 setCfg('showNpcs', false)
 cleared = 0; rebuilds = 0
-upd4(DT)
+-- A poll with display off returns OFF_INTERVAL, so from here the chain is on
+-- the long cadence and OFF is what reaches the next tick. Advancing a poll
+-- interval would queue-starve the section and make the checks below vacuous.
+T.advance(INTERVAL)
 check('turning NPC display off clears the gear', cleared > 0, 'removeVfx calls=' .. cleared)
-upd4(INTERVAL)
+T.advance(OFF)
 check('and stays cleared without rebuilding', rebuilds == 0, 'addVfx calls=' .. rebuilds)
 setCfg('showNpcs', true)
 rebuilds = 0
-upd4(INTERVAL); upd4(INTERVAL)
+T.advance(OFF)
 check('turning it back on redraws, although nothing about the NPC changed', rebuilds > 0,
       'addVfx calls=' .. rebuilds)
 
@@ -256,80 +296,104 @@ anim.addVfx    = function() adds = adds + 1 end
 anim.removeVfx = function() removes = removes + 1 end
 
 -- A cell of distant NPCs loads: nobody builds.
+T.clear()
 math.randomseed(99)
-local farActors, farUpd = {}, {}
+local farActors, farHandlers = {}, {}
 for i = 1, 40 do
     farActors[i] = newActor(8000); guardInventory(farActors[i])
-    current = farActors[i]; farUpd[i] = common.makeUpdateHandler(farActors[i], nil)
+    current = farActors[i]
+    farHandlers[i] = common.makeUpdateHandler(farActors[i], nil)
+    farHandlers[i].onActive()
 end
 adds = 0
-for _ = 1, math.floor(3 / DT) do
-    for i = 1, 40 do current = farActors[i]; farUpd[i](DT) end
-end
+T.run(3)
 check('40 NPCs beyond range build nothing at cell load', adds == 0, 'addVfx calls=' .. adds)
 
 -- Far-tier re-checks are spread, not all in one frame.
 local polls = {}
 for f = 1, math.floor(4 / DT) do
     local before = stats.polls
-    for i = 1, 40 do current = farActors[i]; farUpd[i](DT) end
+    T.advance(DT)
     polls[f] = stats.polls - before
 end
 check('far NPCs do no state reads at all (distance only)', (function()
     for _, n in ipairs(polls) do if n ~= 0 then return false end end
     return true end)())
 
+-- One actor from here on: retire the cell so its far-tier ticks cannot be
+-- mistaken for this actor's.
+T.clear()
 local d = newActor(8000); guardInventory(d); current = d
-local upd5, act5 = common.makeUpdateHandler(d, nil)
-upd5(DT)
+local h5 = common.makeUpdateHandler(d, nil)
+h5.onActive()
+T.advance(INTERVAL)
 adds = 0
 d.position = vec(1000, 0, 0)                 -- walks into range
-upd5(FAR)
+-- Out of range the chain re-arms at FAR_INTERVAL, so FAR -- not the poll
+-- interval -- is what reaches its next check.
+T.advance(FAR)
 check('an NPC walking into range draws on its next far-tier check', adds > 0, 'addVfx calls=' .. adds)
 
 adds, removes = 0, 0
 d.position = vec(3300, 0, 0)                 -- beyond 3072, inside 3072*1.15
-upd5(INTERVAL); upd5(INTERVAL)
+T.advance(INTERVAL); T.advance(INTERVAL)
 check('inside the hysteresis band it stays drawn', removes == 0 and adds == 0,
       ('add=%d remove=%d'):format(adds, removes))
 
 d.position = vec(3700, 0, 0)                 -- beyond the band
-upd5(INTERVAL)
+T.advance(INTERVAL)
 check('beyond the band it clears', removes > 0, 'removeVfx calls=' .. removes)
 
 adds = 0
 d.position = vec(3300, 0, 0)                 -- back into the band, from outside
-upd5(FAR)
+T.advance(FAR)
 check('re-entering the band from outside does NOT redraw (must come within range)', adds == 0,
       'addVfx calls=' .. adds)
 d.position = vec(3000, 0, 0)
-upd5(FAR)
+T.advance(FAR)
 check('within range it redraws', adds > 0, 'addVfx calls=' .. adds)
 
+-- d's chain is retired for the two checks below. It stays armed otherwise, and
+-- a settings change makes every live actor rebuild on its next poll -- which
+-- would hand these two their addVfx call without the actor under test ever
+-- having built anything.
+h5.onInactive()
 setCfg('npcRange', 0)
 local e = newActor(50000); guardInventory(e); current = e
-local upd6 = common.makeUpdateHandler(e, nil)
+local h6 = common.makeUpdateHandler(e, nil)
+-- Zeroed BEFORE onActive: the forced build is synchronous inside it, so
+-- clearing the counter afterwards would discard the very call under test.
 adds = 0
-upd6(DT)
+h6.onActive()
+T.advance(INTERVAL)
 check('npcRange = 0 means unlimited', adds > 0, 'addVfx calls=' .. adds)
 
 local pl = newActor(50000); guardInventory(pl); current = pl
 setCfg('npcRange', 3072)
-local updP = common.makeUpdateHandler(pl, true)
+local hP = common.makeUpdateHandler(pl, true)
+-- Zeroed before onActive, as above.
 adds = 0
-updP(DT)
+hP.onActive()
+T.advance(INTERVAL)
 check('the player is never range-gated', adds > 0, 'addVfx calls=' .. adds)
 
 -- ---------------------------------------------------------------------------
 print('6. re-activation rebuilds although nothing changed')
+-- d alone again: retire the two chains from the range-gate checks the way the
+-- engine retires a script that goes inactive.
+h6.onInactive(); hP.onInactive()
 current = d
 d.position = vec(0, 0, 0)
-upd5(FAR); upd5(INTERVAL)
+-- Bring d back and let its forced build and a whole FULL_SCAN_MULT cycle go by,
+-- so what follows is a genuinely steady chain rather than an unfinished one.
+h5.onActive()
+T.advance(INTERVAL)
+T.run(FULL)
 adds = 0
-upd5(INTERVAL)
+T.run(FULL)
 check('steady: nothing rebuilt', adds == 0, 'addVfx calls=' .. adds)
-act5()
-upd5(DT)
-check('onActive forces a rebuild on the next frame', adds > 0, 'addVfx calls=' .. adds)
+h5.onActive()
+T.advance(INTERVAL)
+check('onActive forces a rebuild on its next poll', adds > 0, 'addVfx calls=' .. adds)
 
 print(fails == 0 and 'ALL PASS' or (fails .. ' FAILURES'))

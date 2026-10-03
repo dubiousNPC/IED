@@ -31,9 +31,17 @@ end
 general:subscribe(async:callback(push))
 weapons:subscribe(async:callback(push))
 
+-- The player's own handlers come from common (no onUpdate; see the note on
+-- makeUpdateHandler), with `push` folded into onActive so the global section
+-- is re-seeded on every load as well as on every settings change.
+local handlers = common.makeUpdateHandler(self, true)
+local commonActive = handlers.onActive
+handlers.onActive = function()
+    push()
+    commonActive()
+end
+handlers.onLoad = handlers.onActive
+
 return {
-    engineHandlers = {
-        onUpdate = common.makeUpdateHandler(self, true),
-        onActive = push,
-    }
+    engineHandlers = handlers,
 }

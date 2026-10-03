@@ -62,9 +62,16 @@ package.preload['openmw.storage']=function() return {
     globalSection=function()
         return dofile('tools/mock_storage.lua').section(function() return world.cfg end, cfgSubs)
     end } end
+-- The poll chain re-arms itself from newUnsavableSimulationTimer, so a mock
+-- that fires the callback inline recurses until the stack goes. Queue against a
+-- simulated clock instead. There is no per-actor `current` slot in this
+-- harness -- one actor, read through the `world` table -- so the hooks are
+-- no-ops.
+local T = dofile('tools/mock_timers.lua').new(function() return nil end, function() end)
+local INTERVAL = 0.5   -- player poll interval (POLL_INTERVAL, no NPC multiplier)
 package.preload['openmw.async']=function() return {
     callback=function(_,f) return f end,
-    newUnsavableSimulationTimer=function(_,_,f) f() end } end
+    newUnsavableSimulationTimer=function(_,d,f) T.add(d,f) end } end
 package.preload['openmw.interfaces']=function() return {} end
 package.preload['openmw.nearby']=function() return { players = {} } end
 package.preload['scripts.show-all-weapons.categories']=function() return dofile(DIR..'categories.lua') end
@@ -295,10 +302,13 @@ world.equip={}; world.stance=0; world.vfx={}
 setCfg{}
 for b in pairs({['Bip01 LongBladeOneHand']=1,['Bip01 AttachShield']=1}) do world.bones[b]=true end
 
-local update = common2.makeUpdateHandler({}, true)
+local h = common2.makeUpdateHandler({}, true)
 check('IED subscribes to AnimRefresh', subs['InventoryEquipmentDisplay']~=nil)
 
-update(99)                       -- first pass builds
+-- onActive arms the chain; its first poll is the forced build, staggered by up
+-- to one interval, so one interval of clock is what makes it happen.
+h.onActive()
+T.advance(INTERVAL)              -- first pass builds
 check('gear shows normally', world.vfx['Bip01 LongBladeOneHand']~=nil)
 
 -- the skeleton is mid-rebuild: every bone reports missing
