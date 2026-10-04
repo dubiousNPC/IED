@@ -1,6 +1,6 @@
 # Dubious Equipment Display
 
-PLAYER: scripts/AnimRefresh/AnimRefresh_v4.lua
+PLAYER: scripts/AnimRefresh/AnimRefresh_v5.lua
 
 # DropinUtils multiCheckbox renderer. MUST load before settings.lua, which
 # registers its weapon rows with this renderer.

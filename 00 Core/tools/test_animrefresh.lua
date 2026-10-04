@@ -1,8 +1,8 @@
--- AnimRefresh v4 contract test. Runs the REAL file against a simulated engine.
+-- AnimRefresh v5 contract test. Runs the REAL file against a simulated engine.
 --   python3 tools/luarun.py tools/test_animrefresh.lua
 -- Every check here corresponds to a fault demonstrated in v3 (see the review
 -- notes in the file header) or to an edge found while writing v4.
-local PATH = 'scripts/AnimRefresh/AnimRefresh_v4.lua'
+local PATH = 'scripts/AnimRefresh/AnimRefresh_v5.lua'
 local FAILED = false
 local function check(n, c, e)
     print((c and '  ok   ' or '  FAIL ') .. n .. (c and '' or ('  got: ' .. tostring(e))))
@@ -39,7 +39,7 @@ IFACES[AR.interfaceName] = AR.interface
 local AN = IFACES.AnimRefresh
 local H = AR.engineHandlers
 local E = AR.eventHandlers or {}
-check('registers version 4', AN.version == 4)
+check('registers version 5', AN.version == 5)
 check('no TogglePOV trigger handler is registered', true)   -- nothing to register into
 -- Every OpenMW engine handler is named on*. Anything else under engineHandlers
 -- is logged as "Not supported handler" and never called -- which is how

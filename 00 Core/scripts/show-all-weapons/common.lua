@@ -31,18 +31,6 @@ local NPC_RANGE = 3072
 -- Out of range, an NPC only re-checks its distance, at this interval.
 local FAR_INTERVAL = 2.0
 
--- With NPC display switched off an NPC has nothing to do but notice that it
--- came back on, which arrives as a settings change anyway. Long on purpose.
-local OFF_INTERVAL = 3.0
-
--- The inventory walk runs once per this many polls; the cheap tier runs on
--- every one. An actor's inventory is near-static while you stand next to them,
--- and the walk is the half of the cost that scales with what they carry. At
--- the default 0.5 s player poll (1.0 s for NPCs) this puts the walk at 4 s
--- per NPC, which is invisible for an NPC acquiring an item and is not the
--- tier that notices a weapon being drawn.
-local FULL_SCAN_MULT = 4
-
 -- Hysteresis: shown within NPC_RANGE, hidden only beyond NPC_RANGE * this.
 -- Without it an NPC pacing on the boundary would rebuild on every check.
 local RANGE_HYSTERESIS = 1.15
@@ -294,49 +282,17 @@ local function newSnapshot()
     return snap
 end
 
--- The state is pushed in TWO tiers, because the two halves cost very
--- different amounts and have very different latency requirements.
---
--- The cheap tier is four values and the reads behind them are a fixed handful
--- regardless of how much the actor is carrying. It holds the only thing in here
--- a player can watch change: `isDrawn`. An NPC entering combat sheathes or
--- draws, and the copy DED paints has to appear or vanish with it, so this tier
--- is checked on every poll.
---
--- The expensive tier walks the whole weapon list and, when shields are shown,
--- the whole armor list, reading a recordId off each. That is the bulk of the
--- per-poll cost and it scales with the actor's inventory -- and an NPC's
--- inventory essentially never changes while you are standing next to them. It
--- is checked every FULL_SCAN_MULT polls, and out of step with the cheap tier
--- on purpose.
---
--- Keep both in step with handler(): if the rebuild starts reading something
--- new, push it in whichever tier can change it.
-local function pushCheapState(snap, equippedWeaponId, equippedShieldId, isDrawn)
+-- Pushes everything a rebuild depends on. Keep this in step with handler():
+-- if the rebuild starts reading something new, push it here too.
+local function pushState(snap, inv, equippedWeaponId, equippedShieldId, isDrawn, isPlayer)
     snap.push(equippedWeaponId or false)
     snap.push(equippedShieldId or false)
     snap.push(isDrawn)
     snap.push(cfgVersion)
-end
 
-local function pushFullState(snap, inv, isPlayer)
-    -- recordId for every weapon, but `count` only for ammo.
-    --
-    -- A count is an engine property read per item per poll, and for everything
-    -- except ammo it cannot change what is drawn: the rebuild dedupes weapons
-    -- by recordId (`seen[rid]`), so a second identical sword is not a second
-    -- VFX, and going from one to two of them is not a visual change. Ammo is
-    -- the exception and the reason the field is read at all -- the quiver draws
-    -- up to MAX_AMMO_DISPLAY arrows, so its count IS the display.
-    --
-    -- weaponRecord is the rid-keyed cache, so the extra lookup is a Lua table
-    -- hit that replaces a crossing into the engine.
     for _, item in ipairs(inv:getAll(types.Weapon)) do
         snap.push(item.recordId)
-        local rec = weaponRecord(item)
-        if rec and AMMO_TYPES[rec.type] then
-            snap.push(item.count)
-        end
+        snap.push(item.count)
     end
     -- Separator that cannot collide with a recordId or a count, so a weapon
     -- list that shrinks by one while the shield list grows by one still
@@ -347,11 +303,8 @@ local function pushFullState(snap, inv, isPlayer)
     if shown('shield', isPlayer) then
         for _, item in ipairs(inv:getAll(types.Armor)) do
             if isDisplayableShield(armorRecord(item)) then
-                -- No count, for the reason above: the shield loop fills a
-                -- fixed number of slots from distinct records, so a stack of
-                -- two identical shields is one object drawn once and its count
-                -- is not part of what is displayed.
                 snap.push(item.recordId)
+                snap.push(item.count)
             end
         end
     end
@@ -533,59 +486,28 @@ end
 -- UPDATE HANDLER
 -- ---------------------------------------------------------------------------
 
----Builds this actor's poller and returns the engine handlers for it.
----
----There is deliberately no onUpdate. The engine calls an onUpdate handler on
----every active script every frame, and in a dense city that dispatch WAS the
----mod: measured on 80 city NPCs, 4,800 of 5,831 attributable ops per second
----were the per-frame call itself, most of them doing nothing but add dt to a
----timer that was not due. A self-re-arming simulation timer costs nothing
----between ticks and lets each tick choose when the next one lands.
----
 ---@param actor any
 ---@param isPlayer boolean|nil true for the player script; NPC scripts pass nil
----@return table engineHandlers
+---@return function onUpdate
+---@return function onActive
 function M.makeUpdateHandler(actor, isPlayer)
-    -- Resolved once, here, and never again. The inventory object is a live
-    -- view: it reflects additions and removals by itself, so re-resolving it
-    -- per poll bought nothing.
     local inv          = types.Actor.inventory(actor)
-    -- Two snapshots rather than one, so the cheap tier can be compared on
-    -- every poll while the expensive walk runs every FULL_SCAN_MULT polls.
-    -- Separate objects because each compares its values by position, and
-    -- pushing a different number of values into one of them would misalign it.
-    local cheapSnap    = newSnapshot()
-    local fullSnap     = newSnapshot()
-    local fullDue      = 0       -- polls remaining until the next full walk
+    local timer        = 0
+    local snap         = newSnapshot()
     local hidden       = false   -- false | 'toggle' | 'range'
     local forceRebuild = true    -- first pass always builds
 
     ---@return boolean changed, any w, any s, boolean drawn
-    local function takeCheap()
+    local function takeSnapshot()
         local w, s, drawn = readState(actor)
-        cheapSnap.begin()
-        pushCheapState(cheapSnap, w and w.recordId, s and s.recordId, drawn)
-        return cheapSnap.finish(), w, s, drawn
-    end
-
-    ---@return boolean changed
-    local function takeFull()
-        fullSnap.begin()
-        pushFullState(fullSnap, inv, isPlayer)
-        return fullSnap.finish()
-    end
-
-    local function invalidate()
-        cheapSnap.invalidate()
-        fullSnap.invalidate()
-        fullDue = 0
+        snap.begin()
+        pushState(snap, inv, w and w.recordId, s and s.recordId, drawn, isPlayer)
+        return snap.finish(), w, s, drawn
     end
 
     ---@return boolean ready
     local function rebuildNow()
-        local _, w, s, drawn = takeCheap()
-        takeFull()
-        fullDue = FULL_SCAN_MULT
+        local _, w, s, drawn = takeSnapshot()
         local ready = handler(actor, w, s, drawn, isPlayer, inv)
         forceRebuild = false
         return ready
@@ -595,7 +517,7 @@ function M.makeUpdateHandler(actor, isPlayer)
     local function hide(reason)
         if not hidden then
             clearVfx(actor)
-            invalidate()
+            snap.invalidate()
         end
         hidden = reason
     end
@@ -607,22 +529,30 @@ function M.makeUpdateHandler(actor, isPlayer)
         end, { verify = true })
     end
 
-    -- One poll. Returns the delay until the next one, which is how the tiers,
-    -- the range gate and the off-switch all get their own cadence without a
-    -- per-frame timer to compare against.
-    ---@return number delay seconds
-    local function poll()
-        -- First, so an NPC with display off costs one boolean and a re-arm.
+    local function onUpdate(dt)
+        -- FIRST, before the timer: with NPC display off this boolean is the
+        -- entire per-frame cost on every NPC.
         if not isPlayer and not cfgCache.showNpcs then
             hide('toggle')
             forceRebuild = false
-            return OFF_INTERVAL
+            return
         end
         -- Toggled back on: redraw now, not one far-tier interval later.
         if hidden == 'toggle' then
             hidden = false
             forceRebuild = true
         end
+
+        timer = timer + (dt or 0)
+        local interval
+        if isPlayer then
+            interval = pollInterval(true)
+        elseif hidden == 'range' then
+            interval = FAR_INTERVAL
+        else
+            interval = pollInterval(false)
+        end
+        if timer < interval and not forceRebuild then return end
 
         local wasForced = forceRebuild
         forceRebuild = false
@@ -631,74 +561,28 @@ function M.makeUpdateHandler(actor, isPlayer)
         -- distant NPCs pays nothing at load beyond one distance check each.
         if not isPlayer and not withinRange(actor, not hidden) then
             hide('range')
-            return FAR_INTERVAL
+            -- Random phase for the far tier as well, so a crowd leaving range
+            -- together does not re-check in the same frame forever.
+            timer = wasForced and math.random() * FAR_INTERVAL or 0
+            return
         end
         hidden = false
 
         if wasForced then
             rebuildNow()
-            return pollInterval(isPlayer)
+            -- Random phase, set once. Every NPC in a cell is activated in the
+            -- same frame, so a shared timer = 0 put all of them on the same
+            -- poll frame, every interval, forever. The first build itself
+            -- stays immediate so gear never pops in late.
+            timer = math.random() * interval
+            return
         end
+        timer = 0
 
-        -- Cheap tier every poll: this is where a drawn or sheathed weapon is
-        -- noticed, and that one is visible to the player.
-        local changed, w, s, drawn = takeCheap()
+        local changed, w, s, drawn = takeSnapshot()
+        if not changed then return end
 
-        -- Expensive tier on its own cadence. Also taken whenever the cheap
-        -- tier moved, because a rebuild needs both to be current -- otherwise
-        -- the next full walk would compare against a snapshot from before a
-        -- rebuild it did not take part in, and report a change that is not one.
-        fullDue = fullDue - 1
-        if fullDue <= 0 or changed then
-            if takeFull() then changed = true end
-            fullDue = FULL_SCAN_MULT
-        end
-
-        if changed then
-            handler(actor, w, s, drawn, isPlayer, inv)
-        end
-        return pollInterval(isPlayer)
-    end
-
-    -- The self-re-arming chain. `gen` is what stops a restart leaving two
-    -- chains running: onActive calls start() and any timer from before it
-    -- carries an older generation and retires itself on firing.
-    local gen = 0
-    local arm
-
-    -- Cleanup-and-rethrow, and the only pcall in this file.
-    --
-    -- It is not here to survive the error -- the error is re-raised unchanged,
-    -- so the engine logs it exactly as it would have. It is here because this
-    -- chain re-arms itself. An engine handler that raises is caught, logged and
-    -- called again next frame; a timer that raises before it has armed its
-    -- successor is never called again, and that actor's display is frozen for
-    -- the rest of the session with one log line to explain it. Moving off
-    -- onUpdate is what created the need for this guard.
-    ---One poll, guarded, returning the delay until the next.
-    ---Shared by the chain and by onActive, so an immediate service and a timed
-    ---one cannot drift apart in their gates or their error handling.
-    ---@return number delay
-    local function serviceNow()
-        local ok, delay = pcall(poll)
-        if not ok then
-            -- Re-arm first, then re-raise: the chain survives, and the error
-            -- still reaches the log unchanged.
-            arm(pollInterval(isPlayer))
-            error(delay, 0)
-        end
-        return delay
-    end
-
-    local function tick(g)
-        if g ~= gen then return end
-        arm(serviceNow())
-    end
-
-    function arm(delay)
-        gen = gen + 1
-        local g = gen
-        async:newUnsavableSimulationTimer(delay, function() tick(g) end)
+        handler(actor, w, s, drawn, isPlayer, inv)
     end
 
     -- An actor leaving the active grid loses its animation object, and with it
@@ -707,44 +591,13 @@ function M.makeUpdateHandler(actor, isPlayer)
     -- compares equal and the gear stays missing until something moves.
     -- activeTags is deliberately kept: rebuild's clearVfx removes those ids,
     -- a no-op if the engine already dropped them, and a real cleanup if not.
-    --
-    -- This is also what re-arms the chain, which matters in three cases that
-    -- all land here: a save load drops unsavable timers, an inactive script's
-    -- timers do not fire, and onInactive stops the chain on purpose.
     local function onActive()
-        invalidate()
+        snap.invalidate()
         hidden       = false
         forceRebuild = true
-        -- Serviced NOW, synchronously, and only THEN staggered.
-        --
-        -- The first version of this armed the forced build behind the stagger,
-        -- so a freshly activated NPC's gear appeared up to a full poll interval
-        -- (1 s at defaults) after the cell loaded -- visible pop-in, and the
-        -- comment here claimed the opposite. test_poll's "first frame builds
-        -- every NPC" check is what caught it: 2 of 40 built on frame one.
-        --
-        -- This poll runs the same off-switch and range gates as any other, so a
-        -- cell full of distant NPCs still pays only a distance check each. The
-        -- stagger then applies to the polls AFTER the build, which is all it was
-        -- ever for: every NPC in a cell activates on the same frame, and an
-        -- unstaggered chain would hold the whole cell on one poll frame for as
-        -- long as it stayed loaded.
-        local delay = serviceNow()
-        arm(math.random() * delay)
     end
 
-    -- Stopped rather than left running: an inactive script's timers do not
-    -- fire, but their due times still pass, so a whole cell's worth would fire
-    -- together on the frame it comes back. Bumping the generation retires them.
-    local function onInactive()
-        gen = gen + 1
-    end
-
-    return {
-        onActive   = onActive,
-        onInactive = onInactive,
-        onLoad     = onActive,
-    }
+    return onUpdate, onActive
 end
 
 M.handler = handler
