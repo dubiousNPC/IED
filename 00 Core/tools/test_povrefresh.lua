@@ -5,16 +5,21 @@
 -- tested IED's callback in isolation and could not see that the SERVICE was
 -- losing the change (RESEARCH 4.6: a mock must exercise the path the engine
 -- takes). Run from the mod root.
-local A='scripts/AnimRefresh/AnimRefresh_v4.lua'
+local A='scripts/AnimRefresh/AnimRefresh_v5.lua'
 local C='scripts/show-all-weapons/common.lua'
 
 local world={vfx={},bones={},files={},equip={},stance=0,cfg={},mode='third'}
--- One simulated clock for BOTH scripts: AnimRefresh's settle timer and IED's
--- self-re-arming poll chain both come out of newUnsavableSimulationTimer, so a
--- single queue is what the engine actually gives them. There is one actor here
--- and no per-script sandbox to restore, hence the no-op current hooks.
-local T = dofile('tools/mock_timers.lua').new(function() return nil end, function() end)
-local INTERVAL = 0.5   -- player poll interval (POLL_INTERVAL, no NPC multiplier)
+local timers={}   -- {at=, fn=}
+local now=0
+local function advance(dt)
+    now = now + dt
+    local due = {}
+    for i,t in ipairs(timers) do if t.at <= now then due[#due+1]=t end end
+    for _,t in ipairs(due) do
+        for i,x in ipairs(timers) do if x==t then table.remove(timers,i) break end end
+        t.fn()
+    end
+end
 
 local recs={}
 local W={ShortBladeOneHand=0,LongBladeOneHand=1,LongBladeTwoHand=2,BluntOneHand=3,
@@ -43,7 +48,7 @@ package.preload['openmw.input']=function() return {
   registerTriggerHandler=function(name,cb) world.trigger=cb end} end
 package.preload['openmw.async']=function() return {
   callback=function(_,f) return f end,
-  newUnsavableSimulationTimer=function(_,d,f) T.add(d,f) end} end
+  newUnsavableSimulationTimer=function(_,delay,f) timers[#timers+1]={at=now+delay,fn=f} end} end
 package.preload['openmw.types']=function() return {
   Weapon=WeaponT, Armor=ArmorT,
   Actor={inventory=function() return invObj end,
@@ -78,12 +83,8 @@ local common = dofile(C)
 for _,b in ipairs({'Bip01 LongBladeOneHand','Bip01 AttachShield'}) do world.bones[b]=true end
 inv={mk('sword',W.LongBladeOneHand)}
 
--- onActive is what arms the poll chain, and the first poll is the forced
--- build. It is staggered by up to one interval, so one interval on the clock is
--- what makes the build happen.
-local h = common.makeUpdateHandler({}, true)
-h.onActive()
-T.advance(INTERVAL)
+local update = common.makeUpdateHandler({}, true)
+update(99)
 print('after first build, vfx on bone:', tostring(world.vfx['Bip01 LongBladeOneHand']))
 
 -- POV press: engine drops the VFX and rebuilds the animation object.
@@ -99,32 +100,26 @@ world.mode, world.queued = 'first', nil
 -- settle guess, and wipes attached VFX when it does.
 local WIPE_AT = 0.80
 local wiped = false
--- The clock already ran for the first build, so the wipe is timed from the
--- press, not from zero. Advancing the clock is also what drives IED now: its
--- poll chain comes off the same queue as AnimRefresh's settle timer, so there
--- is no per-frame update call to make here.
-local t0 = T.now()
-for _=1,60 do
-  T.advance(0.05)
-  if not wiped and T.now() - t0 >= WIPE_AT then
+for i=1,60 do
+  advance(0.05)
+  if not wiped and now >= WIPE_AT then
     world.vfx = {}      -- engine drops VFX as the new object comes up
     wiped = true
-    print(('  t=%.2f  engine completed the rebuild and dropped the VFX'):format(T.now() - t0))
+    print(('  t=%.2f  engine completed the rebuild and dropped the VFX'):format(now))
   end
   AR.engineHandlers.onUpdate(0.05)
+  update(0.05)
 end
 local recovered = world.vfx['Bip01 LongBladeOneHand'] ~= nil
 print((recovered and '  ok   ' or '  FAIL ')
       .. ('gear recovered after a rebuild that completed at t=%.2f'):format(WIPE_AT))
 if not recovered then FAILED = true end
-print(('after %.1fs, vfx on bone: %s'):format(T.now() - t0, tostring(world.vfx['Bip01 LongBladeOneHand'])))
+print(('after %.1fs, vfx on bone: %s'):format(now, tostring(world.vfx['Bip01 LongBladeOneHand'])))
 print('AnimRefresh mode now:', AR.interface.getMode(), ' actual mode:', world.mode)
 
 print('\n-- now the player draws a weapon --')
 world.stance = 1
--- The cheap tier carries isDrawn, so the next poll on the chain sees it; one
--- interval of clock is enough to get that poll.
-T.run(INTERVAL * 2, 0.05)
+update(1.0)
 print('vfx on bone:', tostring(world.vfx['Bip01 LongBladeOneHand']))
 
 
