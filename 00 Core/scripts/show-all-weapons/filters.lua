@@ -15,15 +15,11 @@ local M = {}
 -- ticking either group blacklists it.
 -- ---------------------------------------------------------------------------
 M.CLASS_GROUP_ORDER = {
-    'commoner', 'publican', 'miner', 'trader', 'alchemist', 'ashlander', 'fighting',
+    'commoner', 'publican', 'miner', 'trader', 'alchemist', 'fighting',
 }
 
 M.CLASS_GROUPS = {
     publican = { 'publican', 't_glb_publican' },
-    ashlander = {
-        'champion', 'wise woman service', 'trader service', 'healer service',
-        'herder', 'scout', 'hunter', 'warrior',
-    },
     alchemist = {
         'healer service', 'alchemist service', 'apothecary service',
         't_glb_apothecaryservice',
@@ -59,7 +55,6 @@ M.FACTION_FAMILY = {
     ['east empire company']   = 'imperial',
     ['dat_imperialcuria']     = 'imperial',
     ['temple']                = 'temple',
-    ['redoran']               = 'temple',
     ['t_mw_ordinators']       = 'temple',
     ['t_mw_houseindoril']     = 'temple',
 }
