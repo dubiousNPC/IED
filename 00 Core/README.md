@@ -69,9 +69,32 @@ equipped shield sheathed, a carried one can show on the Ded shield bone.
 One attachment per distinct record: two of the *same* sword fill one slot, two
 *different* swords fill both.
 
+## NPC filters
+
+Settings → DED → **NPC filters** decides which NPCs display carried gear.
+Your own gear is never filtered.
+
+| Setting | Effect |
+|---|---|
+| **Blacklist class groups** | Ticked groups (Commoners, Publicans, Miners and farmers, Traders and craftsmen, Healers and alchemists, Ashlanders, Fighters) hide every NPC of a class in them. |
+| **Blacklist class IDs** | Extra class IDs to hide. |
+| **Whitelist factions** | NPCs in these factions show gear even if their class is blacklisted. Factions in one family count as one: `imperial legion` also covers Census and Excise, the East Empire Company, the Imperial Knights, the Royal Guard and the Tamriel Rebuilt equivalents; `temple` also covers Redoran and the Ordinators. |
+| **Blacklist cell groups** | Libraries and booksellers; temples and shrines. |
+| **Blacklist cells** | Any cell whose name or ID *contains* the entry. |
+
+Order of precedence: a blacklisted **cell** always hides; otherwise a
+blacklisted **class** hides unless the NPC is in a whitelisted **faction**.
+
+Groups match on class alone. Ashlanders includes warrior, scout and hunter,
+so ticking it also hides non-Ashlander warriors.
+
+Filters are judged when settings change, when an NPC becomes active and when
+it is teleported, never per frame. An NPC walking across an exterior cell
+border is not re-judged until one of those happens.
+
 ## Requirements
 
-The Weapons rows use the multiCheckbox renderer from
+The Weapons rows and NPC filters use the multiCheckbox and textSet renderers from
 [Bor's Drop-in Utils](https://github.com/OpenMW-Mod-Collection/DropinUtils),
 bundled under `scripts/DropinUtils/` and registered ahead of the settings page
 in `DED.omwscripts`.

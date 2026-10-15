@@ -9,6 +9,7 @@ local nearby  = require('openmw.nearby')
 local I       = require('openmw.interfaces')
 local bones   = require('scripts.show-all-weapons.bones')
 local categories = require('scripts.show-all-weapons.categories')
+local filters    = require('scripts.show-all-weapons.filters')
 
 local M = {}
 
@@ -83,6 +84,14 @@ local function refreshCfgCache()
         if not c.alt then f.alternate = false end
         cfgCache.cats[id] = f
     end
+
+    -- NPC filters. getCopy for the same reason as above: these are tables.
+    local fl = cfg:getCopy('filters')
+    if type(fl) ~= 'table' then fl = {} end
+    cfgCache.classSet     = filters.buildClassSet(fl.classGroups, fl.classIds)
+    cfgCache.factionSet   = filters.buildFactionSet(fl.factionIds)
+    cfgCache.cellKeywords = filters.buildCellKeywords(fl.cellGroups, fl.cellIds)
+
     cfgVersion = cfgVersion + 1
 end
 
@@ -483,6 +492,39 @@ local function withinRange(actor, showing)
 end
 
 -- ---------------------------------------------------------------------------
+-- NPC FILTERS
+-- ---------------------------------------------------------------------------
+
+-- Whether an NPC is filtered out of the display:
+--   * in a blacklisted cell                         -> filtered, always
+--   * of a blacklisted class, in no whitelisted faction -> filtered
+--   * of a blacklisted class, in a whitelisted faction  -> shown
+-- The faction whitelist overrides the class blacklist only, not the cell one.
+-- Called when settings change, on activation and on teleport -- never per poll.
+local function npcFiltered(actor)
+    local keywords = cfgCache.cellKeywords
+    if #keywords > 0 then
+        local cell = actor.cell
+        if cell and filters.cellMatches(keywords, cell.name, cell.id) then
+            return true
+        end
+    end
+
+    if next(cfgCache.classSet) == nil then return false end
+    local rec = types.NPC.record(actor)
+    local class = rec and filters.normalize(rec.class)
+    if not class or not cfgCache.classSet[class] then return false end
+
+    if next(cfgCache.factionSet) ~= nil then
+        for _, factionId in pairs(types.NPC.getFactions(actor)) do
+            local id = filters.normalize(factionId)
+            if id and cfgCache.factionSet[id] then return false end
+        end
+    end
+    return true
+end
+
+-- ---------------------------------------------------------------------------
 -- UPDATE HANDLER
 -- ---------------------------------------------------------------------------
 
@@ -494,7 +536,9 @@ function M.makeUpdateHandler(actor, isPlayer)
     local inv          = types.Actor.inventory(actor)
     local timer        = 0
     local snap         = newSnapshot()
-    local hidden       = false   -- false | 'toggle' | 'range'
+    local hidden       = false   -- false | 'toggle' | 'filter' | 'range'
+    local filtered     = false   -- cached npcFiltered() answer (NPCs only)
+    local filterAt     = -1      -- cfgVersion it was computed for; -1 = stale
     local forceRebuild = true    -- first pass always builds
 
     ---@return boolean changed, any w, any s, boolean drawn
@@ -537,8 +581,24 @@ function M.makeUpdateHandler(actor, isPlayer)
             forceRebuild = false
             return
         end
-        -- Toggled back on: redraw now, not one far-tier interval later.
-        if hidden == 'toggle' then
+
+        -- Filters next: settings-, activation- and teleport-driven, so the
+        -- steady-state cost is one integer compare.
+        if not isPlayer then
+            if filterAt ~= cfgVersion then
+                filtered = npcFiltered(actor)
+                filterAt = cfgVersion
+            end
+            if filtered then
+                hide('filter')
+                forceRebuild = false
+                return
+            end
+        end
+
+        -- Toggled or unfiltered back on: redraw now, not one far-tier
+        -- interval later.
+        if hidden == 'toggle' or hidden == 'filter' then
             hidden = false
             forceRebuild = true
         end
@@ -595,9 +655,16 @@ function M.makeUpdateHandler(actor, isPlayer)
         snap.invalidate()
         hidden       = false
         forceRebuild = true
+        filterAt     = -1
     end
 
-    return onUpdate, onActive
+    -- A teleport can move an NPC into or out of a blacklisted cell (a
+    -- follower entering a temple with the player). Re-judge on arrival.
+    local function onTeleported()
+        filterAt = -1
+    end
+
+    return onUpdate, onActive, onTeleported
 end
 
 M.handler = handler

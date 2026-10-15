@@ -2,6 +2,7 @@
 
 local storage    = require('openmw.storage')
 local categories = require('scripts.show-all-weapons.categories')
+local filters    = require('scripts.show-all-weapons.filters')
 
 local state = storage.globalSection('DED_global')
 
@@ -16,6 +17,7 @@ local DEFAULTS = {
     pollInterval = 0.5,
     npcRange     = 3072,
     categories   = defaultCategories(),
+    filters      = filters.defaults(),
 }
 
 local function seed()
