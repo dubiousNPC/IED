@@ -2,11 +2,15 @@
 
 local I          = require('openmw.interfaces')
 local categories = require('scripts.show-all-weapons.categories')
+local filters    = require('scripts.show-all-weapons.filters')
 
 -- Requires DropinUtils' multiCheckbox renderer, registered by
 -- scripts/DropinUtils/settingsRenderers/multiCheckbox.lua, which DED.omwscripts
 -- lists BEFORE this file.
 local MULTI_CHECKBOX = 'multiCheckbox_V1'
+-- DropinUtils textSet renderer (scripts/DropinUtils/settingsRenderers/
+-- textSet.lua), also listed before this file.
+local TEXT_SET = 'textSet_V1'
 
 I.Settings.registerPage({
     key         = 'DED',
@@ -75,6 +79,61 @@ I.Settings.registerGroup({
     permanentStorage = true,
     order            = 2,
     settings         = weaponSettings,
+})
+
+local filterDefaults = filters.defaults()
+
+-- NPC filters. Applied to NPCs only; your own gear is never filtered.
+I.Settings.registerGroup({
+    key              = 'Settings_DED_npcs',
+    page             = 'DED',
+    l10n             = 'DED',
+    name             = 'settings_npcs',
+    description      = 'settings_npcs_desc',
+    permanentStorage = true,
+    order            = 3,
+    settings = {
+        {
+            key         = 'CLASS_GROUPS',
+            name        = 'setting_classgroups',
+            description = 'setting_classgroups_desc',
+            default     = filterDefaults.classGroups,
+            renderer    = MULTI_CHECKBOX,
+            argument    = { l10n = 'DED', keys = filters.CLASS_GROUP_ORDER },
+        },
+        {
+            key         = 'CLASS_IDS',
+            name        = 'setting_classids',
+            description = 'setting_classids_desc',
+            default     = filterDefaults.classIds,
+            renderer    = TEXT_SET,
+            argument    = { lower = true },
+        },
+        {
+            key         = 'FACTION_IDS',
+            name        = 'setting_factionids',
+            description = 'setting_factionids_desc',
+            default     = filterDefaults.factionIds,
+            renderer    = TEXT_SET,
+            argument    = { lower = true },
+        },
+        {
+            key         = 'CELL_GROUPS',
+            name        = 'setting_cellgroups',
+            description = 'setting_cellgroups_desc',
+            default     = filterDefaults.cellGroups,
+            renderer    = MULTI_CHECKBOX,
+            argument    = { l10n = 'DED', keys = filters.CELL_GROUP_ORDER },
+        },
+        {
+            key         = 'CELL_IDS',
+            name        = 'setting_cellids',
+            description = 'setting_cellids_desc',
+            default     = filterDefaults.cellIds,
+            renderer    = TEXT_SET,
+            argument    = { lower = true },
+        },
+    },
 })
 
 return

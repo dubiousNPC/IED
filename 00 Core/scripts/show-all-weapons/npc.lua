@@ -3,11 +3,12 @@
 local self   = require('openmw.self')
 local common = require('scripts.show-all-weapons.common')
 
-local onUpdate, onActive = common.makeUpdateHandler(self)
+local onUpdate, onActive, onTeleported = common.makeUpdateHandler(self)
 
 return {
     engineHandlers = {
-        onUpdate = onUpdate,
-        onActive = onActive,
+        onUpdate     = onUpdate,
+        onActive     = onActive,
+        onTeleported = onTeleported,
     }
 }

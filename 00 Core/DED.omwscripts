@@ -2,9 +2,10 @@
 
 PLAYER: scripts/AnimRefresh/AnimRefresh_v5.lua
 
-# DropinUtils multiCheckbox renderer. MUST load before settings.lua, which
-# registers its weapon rows with this renderer.
+# DropinUtils renderers. MUST load before settings.lua, which registers its
+# weapon rows (multiCheckbox) and NPC filter lists (textSet) with them.
 MENU:   scripts/DropinUtils/settingsRenderers/multiCheckbox.lua
+MENU:   scripts/DropinUtils/settingsRenderers/textSet.lua
 
 MENU:   scripts/show-all-weapons/settings.lua
 GLOBAL: scripts/show-all-weapons/global.lua
