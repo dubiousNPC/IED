@@ -74,9 +74,12 @@ local bones=dofile(DIR..'bones.lua')
 local categories=dofile(DIR..'categories.lua')
 local common=dofile(DIR..'common.lua')
 
--- Settings are cached, not read live, so the test must push a change the same
--- way the engine would rather than mutating world.cfg silently.
+-- Settings are cached, not read live, so the test must deliver a change the
+-- way global.lua does: write the values, then bump 'version'.
+local cfgVer=0
 local function setCfg(t)
+    cfgVer=cfgVer+1
+    t.version=cfgVer
     world.cfg=t
     for _,cb in ipairs(cfgSubs) do cb('DED_global', nil) end
 end
