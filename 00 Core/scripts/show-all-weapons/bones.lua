@@ -33,8 +33,6 @@ function M.categoryOf(weaponType)
     return CATEGORY_BY_TYPE[weaponType]
 end
 
----The standard bone for a weapon type. This is also the bone OpenMW's own
----sheathing uses, which is why it is asked for whatever the layer settings.
 ---@param weaponType number
 ---@return string
 function M.standardBone(weaponType)

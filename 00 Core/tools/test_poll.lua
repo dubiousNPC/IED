@@ -1,12 +1,10 @@
--- Poll-cost harness for makeUpdateHandler. Run from the MOD ROOT:
+-- Poll-cost harness for the NPC timer driver. Run from the MOD ROOT:
 --     python3 tools/luarun.py tools/test_poll.lua
 --
--- Drives the REAL update handler (not the rebuild in isolation) against mocks
--- that count what a poll costs, and checks the three properties the 0.65
--- poll rework is for:
---   1. NPCs activated together do not poll in the same frame.
---   2. A poll that finds nothing changed allocates (almost) nothing in Lua.
---   3. Changing non-shield armor does not trigger a rebuild; a shield does.
+-- Drives the REAL makeNpcDriver against a simulated simulation clock and
+-- mocks that count what a poll costs. Each NPC gets its own copy of
+-- common.lua, as each NPC script does in game, so the settings cache and the
+-- VFX list are per actor here too.
 local DIR = 'scripts/show-all-weapons/'
 local fails = 0
 local function check(n, c, e)
@@ -18,7 +16,7 @@ local W = { ShortBladeOneHand = 0, LongBladeOneHand = 1, LongBladeTwoHand = 2, B
             MarksmanBow = 9, MarksmanCrossbow = 10, MarksmanThrown = 11, Arrow = 12, Bolt = 13 }
 local SHIELD, CUIRASS = 8, 1
 local recs, files = {}, {}
-local stats = { polls = 0, rebuilds = 0 }
+local stats = { polls = 0, walks = 0, adds = 0, removes = 0, refreshes = 0, timers = 0 }
 
 local function mkRec(id, kind, subtype)
     local m = 'meshes/x/' .. id .. '.nif'
@@ -27,10 +25,6 @@ local function mkRec(id, kind, subtype)
 end
 local function item(id, count) return { recordId = id, count = count or 1 } end
 
--- Per-actor world. `current` is swapped in before each actor's update runs,
--- which is what the per-script sandbox gives each actor in game.
--- Minimal openmw.util.Vector3 stand-in: subtraction and length2 are all the
--- range gate uses. Each subtraction allocates, as the engine's does.
 local VMT = {}
 VMT.__index = VMT
 local function vec(x, y, z) return setmetatable({ x = x, y = y, z = z }, VMT) end
@@ -38,18 +32,49 @@ VMT.__sub = function(a, b) return vec(a.x - b.x, a.y - b.y, a.z - b.z) end
 function VMT:length2() return self.x * self.x + self.y * self.y + self.z * self.z end
 
 local player = { position = vec(0, 0, 0) }
-
 local function newActor(dist)
     return { inv = {}, equip = {}, stance = 0, position = vec(dist or 0, 0, 0) }
 end
+-- The actor whose script is running. Timers capture it when armed, which is
+-- what the per-script sandbox gives each actor in game.
 local current
 
+-- ---------------------------------------------------------------------------
+-- Simulated simulation clock
+local now, timers = 0, {}
+local function advance(dt)
+    local target = now + dt
+    while true do
+        local bi
+        for i, t in ipairs(timers) do
+            if t.at <= target and (not bi or t.at < timers[bi].at) then bi = i end
+        end
+        if not bi then break end
+        local t = table.remove(timers, bi)
+        now = math.max(now, t.at)
+        current = t.actor
+        local ok, err = pcall(t.fn)
+        if not ok then stats.errors = (stats.errors or 0) + 1; stats.lastError = err end
+    end
+    now = target
+end
+local function runFor(sec, perFrame)
+    local DT = 1 / 60
+    for f = 1, math.floor(sec / DT + 0.5) do
+        local before = stats.polls
+        advance(DT)
+        if perFrame then perFrame[#perFrame + 1] = stats.polls - before end
+    end
+end
+
+-- ---------------------------------------------------------------------------
 local WeaponT = { TYPE = W, record = function(o) return recs[o.recordId] end,
                   objectIsInstance = function(o) local r = recs[o.recordId]; return r and r.kind == 'weapon' end }
 local ArmorT = { TYPE = { Shield = SHIELD, Cuirass = CUIRASS }, record = function(o) return recs[o.recordId] end,
                  objectIsInstance = function(o) local r = recs[o.recordId]; return r and r.kind == 'armor' end }
 local invObj = {
     getAll = function(_, t)
+        stats.walks = stats.walks + 1
         local want = (t == WeaponT) and 'weapon' or 'armor'
         local out = {}
         for _, i in ipairs(current.inv) do
@@ -63,12 +88,16 @@ local invObj = {
         return n
     end,
 }
-
+local raiseNext = false
 package.preload['openmw.types'] = function() return {
     Weapon = WeaponT, Armor = ArmorT,
+    NPC = { record = function() return { class = 'guard' } end, getFactions = function() return {} end },
     Actor = {
         inventory = function() return invObj end,
-        getEquipment = function() stats.polls = stats.polls + 1; return current.equip end,
+        getEquipment = function()
+            if raiseNext then raiseNext = false; error('injected failure') end
+            stats.polls = stats.polls + 1; return current.equip
+        end,
         getStance = function() return current.stance end,
         STANCE = { Nothing = 0, Weapon = 1, Spell = 2 },
         EQUIPMENT_SLOT = { CarriedRight = 'CR', CarriedLeft = 'CL' },
@@ -78,32 +107,41 @@ package.preload['openmw.types'] = function() return {
 package.preload['openmw.vfs'] = function() return { fileExists = function(p) return files[p] == true end } end
 package.preload['openmw.animation'] = function() return {
     hasBone = function() return true end,
-    addVfx = function() end,
-    removeVfx = function() end,
+    addVfx = function() stats.adds = stats.adds + 1 end,
+    removeVfx = function() stats.removes = stats.removes + 1 end,
 } end
-local cfg = { showNpcs = true }
--- IED reads settings through a cache refreshed by the section's subscription,
--- so a change has to be delivered the way the engine delivers it.
-local cfgSubs = {}
+
+-- Settings are delivered the way global.lua delivers them: the values, then
+-- a 'version' bump. Nothing subscribes.
+local cfg = { showNpcs = true, version = 1 }
+local subs = {}
 local function setCfg(k, v)
     cfg[k] = v
-    for _, cb in ipairs(cfgSubs) do cb('DED_global', k) end
+    cfg.version = cfg.version + 1
 end
 package.preload['openmw.storage'] = function() return {
     globalSection = function()
-        return dofile('tools/mock_storage.lua').section(function() return cfg end, cfgSubs)
+        local sec = dofile('tools/mock_storage.lua').section(function() return cfg end, subs)
+        local getCopy = sec.getCopy
+        sec.getCopy = function(self, k)
+            if k == 'categories' then stats.refreshes = stats.refreshes + 1 end
+            return getCopy(self, k)
+        end
+        return sec
     end,
 } end
 package.preload['openmw.async'] = function() return {
     callback = function(_, f) return f end,
-    newUnsavableSimulationTimer = function(_, _, f) f() end,
+    newUnsavableSimulationTimer = function(_, delay, f)
+        stats.timers = stats.timers + 1
+        timers[#timers + 1] = { at = now + delay, fn = f, actor = current }
+    end,
 } end
 package.preload['openmw.interfaces'] = function() return {} end
 package.preload['openmw.nearby'] = function() return { players = { player } } end
 package.preload['scripts.show-all-weapons.categories'] = function() return dofile(DIR .. 'categories.lua') end
 package.preload['scripts.show-all-weapons.bones'] = function() return dofile(DIR .. 'bones.lua') end
-
-local common = dofile(DIR .. 'common.lua')
+package.preload['scripts.show-all-weapons.filters'] = function() return dofile(DIR .. 'filters.lua') end
 
 mkRec('longsword', 'weapon', W.LongBladeOneHand)
 mkRec('axe', 'weapon', W.AxeOneHand)
@@ -123,213 +161,257 @@ local function guardInventory(a)
     a.equip = { CR = a.inv[1] }
 end
 
-local DT = 1 / 60
+-- One NPC script: its own module copy, its handlers, activated.
+local function spawn(dist, noActivate)
+    local a = newActor(dist); guardInventory(a)
+    current = a
+    local common = dofile(DIR .. 'common.lua')
+    a.h = common.makeNpcDriver(a)
+    if not noActivate then current = a; a.h.onActive() end
+    return a
+end
+
 local INTERVAL = 1.0     -- NPC cadence: 0.5s player interval x NPC_INTERVAL_MULT 2
 local FAR = 2.0
+local SPREAD = 0.5       -- ACTIVATE_SPREAD
+local WALK_EVERY = 4     -- FULL_SCAN_MULT
 
 -- ---------------------------------------------------------------------------
-print('1. NPCs activated together are spread across the poll interval')
+print('0. the NPC script has no onUpdate')
+do
+    local env = setmetatable({}, { __index = _G })
+    package.loaded['openmw.self'] = newActor(0)
+    package.preload['scripts.show-all-weapons.common'] = function() return dofile(DIR .. 'common.lua') end
+    current = package.loaded['openmw.self']; guardInventory(current)
+    local npc = dofile(DIR .. 'npc.lua')
+    local eh = npc.engineHandlers
+    check('npc.lua registers no onUpdate', eh.onUpdate == nil)
+    check('and registers onActive, onInactive, onLoad, onTeleported',
+          eh.onActive and eh.onInactive and eh.onLoad and eh.onTeleported)
+    timers = {}
+end
+
+-- ---------------------------------------------------------------------------
+print('1. NPCs activated together are spread out, and all draw within the spread window')
 math.randomseed(1234)
 local N = 40
-local actors, updates = {}, {}
-for i = 1, N do
-    actors[i] = newActor(); guardInventory(actors[i])
-    current = actors[i]
-    updates[i] = common.makeUpdateHandler(actors[i], nil)
-end
-local pollsPerFrame = {}
-local frames = math.floor(5 / DT)
-for f = 1, frames do
-    local before = stats.polls
-    for i = 1, N do current = actors[i]; updates[i](DT) end
-    pollsPerFrame[f] = stats.polls - before
-end
--- Skip the first second: frame 1 is the forced first build for everyone,
--- which is intended (gear appears immediately on cell load).
+stats.adds, stats.polls = 0, 0
+local actors = {}
+for i = 1, N do actors[i] = spawn(0) end
+local perFrame = {}
+runFor(SPREAD + 1 / 60, perFrame)
+local builtBy = stats.polls
+local actWorst = 0
+for _, n in ipairs(perFrame) do actWorst = math.max(actWorst, n) end
+print(string.format('     activation: %d of %d polled within %.2fs, worst frame %d', builtBy, N, SPREAD, actWorst))
+check('every NPC has polled (and drawn) within the spread window', builtBy == N, builtBy)
+check('no activation frame carries more than a quarter of the NPCs', actWorst <= N / 4, actWorst)
+check('every NPC drew', stats.adds >= N, stats.adds)
+
+perFrame = {}
+runFor(5, perFrame)
 local worst, total = 0, 0
-local steadyFrames = 0
-for f = math.floor(1 / DT) + 1, frames do
-    worst = math.max(worst, pollsPerFrame[f])
-    total = total + pollsPerFrame[f]
-    steadyFrames = steadyFrames + 1
-end
-local ideal = N * DT / INTERVAL
-print(string.format('     %d NPCs, %.1fs interval: worst frame %d polls, mean %.2f (even spread ~%.2f)',
-    N, INTERVAL, worst, total / steadyFrames, ideal))
-check('first frame builds every NPC (no pop-in delay)', pollsPerFrame[1] == N, pollsPerFrame[1])
-check('steady state: no frame carries more than a quarter of the NPCs', worst <= N / 4,
-      'worst=' .. worst)
+for _, n in ipairs(perFrame) do worst = math.max(worst, n); total = total + n end
+print(string.format('     steady: worst frame %d polls, mean %.2f (even spread ~%.2f)',
+    worst, total / #perFrame, N / 60 / INTERVAL))
+check('steady state: no frame carries more than a quarter of the NPCs', worst <= N / 4, 'worst=' .. worst)
+check('steady state: one poll per NPC per interval', math.abs(total - N * 5 / INTERVAL) <= N,
+      total)
+for _, a in ipairs(actors) do a.h.onInactive() end
+runFor(2)
 
 -- ---------------------------------------------------------------------------
-print('2. an unchanged poll allocates almost nothing')
-local a = newActor(); guardInventory(a); current = a
-local upd = common.makeUpdateHandler(a, nil)
-upd(DT)                                 -- forced first build
-for _ = 1, 200 do upd(DT) end           -- settle, prime record caches
+print('2. an unchanged poll is cheap: the inventory walk runs one poll in four')
+local a = spawn(0)
+runFor(SPREAD + 3 * INTERVAL)                -- first build, settle, prime caches
+local p0, w0 = stats.polls, stats.walks
+runFor(40 * INTERVAL)
+local polls, walks = stats.polls - p0, (stats.walks - w0) / 2   -- 2 getAll per walk
+print(string.format('     %d polls, %d inventory walks', polls, walks))
+check('40 polls in 40 s', polls == 40, polls)
+check('one walk per ' .. WALK_EVERY .. ' polls', walks == 40 / WALK_EVERY, walks)
+
 collectgarbage('collect'); collectgarbage('stop')
-local polls0 = stats.polls
 local kb0 = collectgarbage('count')
-local t = 0
-while stats.polls - polls0 < 1000 do upd(INTERVAL) ; t = t + 1 end
+p0 = stats.polls
+runFor(200 * INTERVAL)
 local kb = collectgarbage('count') - kb0
 collectgarbage('restart')
--- The mock's getAll/getEquipment return fresh tables like the engine does;
--- those are not IED's to avoid. Measure them separately and subtract.
+local n = stats.polls - p0
+-- Subtract what the engine-shaped mocks allocate: getAll tables, the timer
+-- record, and the vector in the range gate.
 collectgarbage('collect'); collectgarbage('stop')
 local m0 = collectgarbage('count')
-for _ = 1, 1000 do
-    invObj:getAll(WeaponT); invObj:getAll(ArmorT)
-    local _ = (a.position - player.position):length2()   -- engine Vector3 in game
+for _ = 1, n do
+    if _ % WALK_EVERY == 0 then invObj:getAll(WeaponT); invObj:getAll(ArmorT) end
+    local _ = (a.position - player.position):length2()
+    local _t = { at = 0, fn = print, actor = a }
 end
 local mockKb = collectgarbage('count') - m0
 collectgarbage('restart')
-local iedBytesPerPoll = math.max(0, (kb - mockKb) * 1024 / 1000)
-print(string.format('     1000 unchanged polls: %.1f KB total, %.1f KB from engine-shaped getAll tables and vectors, '
-    .. '%.0f bytes/poll allocated by IED itself', kb, mockKb, iedBytesPerPoll))
-check('IED allocates under 64 bytes per unchanged poll', iedBytesPerPoll < 64,
-      string.format('%.0f bytes', iedBytesPerPoll))
+local perPoll = math.max(0, (kb - mockKb) * 1024 / n)
+print(string.format('     %d unchanged polls: %.0f bytes/poll allocated by DED itself',
+    n, perPoll))
+check('DED allocates under 64 bytes per unchanged poll', perPoll < 64, string.format('%.0f bytes', perPoll))
+a.h.onInactive(); runFor(2)
 
 -- ---------------------------------------------------------------------------
-print('3. only shield changes rebuild; other armor does not')
-local rebuilds = 0
-local anim = require('openmw.animation')
-anim.removeVfx = function() end
-anim.addVfx = function() rebuilds = rebuilds + 1 end
-local b = newActor(); guardInventory(b); current = b
-local upd3 = common.makeUpdateHandler(b, nil)
-upd3(DT)
-rebuilds = 0
--- swap cuirass: not displayed by IED
+print('3. what rebuilds')
+local b = spawn(0)
+runFor(SPREAD + 2 * INTERVAL)
+local SCAN = WALK_EVERY * INTERVAL + 0.01
+stats.adds = 0
 b.inv[6] = item('cuirass2')
-upd3(INTERVAL); upd3(INTERVAL)
-check('swapping a cuirass does not rebuild', rebuilds == 0, 'addVfx calls=' .. rebuilds)
--- picking up a second shield: displayed candidate, must be seen
-rebuilds = 0
+runFor(SCAN)
+check('swapping a cuirass does not rebuild', stats.adds == 0, stats.adds)
+stats.adds = 0
 b.inv[#b.inv + 1] = item('shield_b')
-upd3(INTERVAL); upd3(INTERVAL)
-check('picking up a shield does rebuild', rebuilds > 0, 'addVfx calls=' .. rebuilds)
--- weapon count change (arrows fired) must still be seen: quiver display
-rebuilds = 0
+runFor(SCAN)
+check('picking up a shield rebuilds within one walk', stats.adds > 0, stats.adds)
+stats.adds = 0
 b.inv[4] = item('arrow', 12)
-upd3(INTERVAL); upd3(INTERVAL)
-check('arrow count change still rebuilds', rebuilds > 0, 'addVfx calls=' .. rebuilds)
--- drawing the weapon must still be seen
-rebuilds = 0
+runFor(SCAN)
+check('an arrow count change rebuilds within one walk', stats.adds > 0, stats.adds)
+stats.adds = 0
+b.inv[2] = item('axe', 2)
+runFor(SCAN)
+check('a weapon stack count change does not rebuild (only ammo counts are read)', stats.adds == 0, stats.adds)
+stats.adds = 0
 b.stance = 1
-upd3(INTERVAL); upd3(INTERVAL)
-check('drawing the weapon still rebuilds', rebuilds > 0, 'addVfx calls=' .. rebuilds)
--- no change at all: nothing
-rebuilds = 0
-upd3(INTERVAL); upd3(INTERVAL)
-check('nothing changed, nothing rebuilt', rebuilds == 0, 'addVfx calls=' .. rebuilds)
--- a settings change rebuilds although the inventory did not move
+runFor(INTERVAL + 0.01)
+check('drawing the weapon rebuilds on the next poll, not the next walk', stats.adds > 0, stats.adds)
+stats.adds = 0
+runFor(SCAN)
+check('nothing changed, nothing rebuilt', stats.adds == 0, stats.adds)
 setCfg('categories', { longBlade = { secondary = true } })
-rebuilds = 0
-upd3(INTERVAL); upd3(INTERVAL)
-check('changing a category checkbox rebuilds', rebuilds > 0, 'addVfx calls=' .. rebuilds)
-setCfg('categories', nil)
+stats.adds = 0
+runFor(INTERVAL + 0.01)
+check('changing a category rebuilds on the next poll', stats.adds > 0, stats.adds)
+setCfg('categories', nil); runFor(INTERVAL + 0.01)
+b.h.onInactive(); runFor(2)
 
 -- ---------------------------------------------------------------------------
-print('4. the NPC display toggle still clears and restores')
-local cleared = 0
-anim.removeVfx = function() cleared = cleared + 1 end
-local c = newActor(); guardInventory(c); current = c
-local upd4 = common.makeUpdateHandler(c, nil)
-upd4(DT)
+print('4. the NPC display toggle clears and restores')
+local c = spawn(0)
+runFor(SPREAD + INTERVAL)
 setCfg('showNpcs', false)
-cleared = 0; rebuilds = 0
-upd4(DT)
-check('turning NPC display off clears the gear', cleared > 0, 'removeVfx calls=' .. cleared)
-upd4(INTERVAL)
-check('and stays cleared without rebuilding', rebuilds == 0, 'addVfx calls=' .. rebuilds)
+stats.removes, stats.adds = 0, 0
+runFor(INTERVAL + 0.01)
+check('turning NPC display off clears the gear within a poll', stats.removes > 0, stats.removes)
+local pOff = stats.polls
+runFor(10)
+check('and stays cleared without rebuilding or reading state', stats.adds == 0 and stats.polls == pOff,
+      ('adds=%d reads=%d'):format(stats.adds, stats.polls - pOff))
 setCfg('showNpcs', true)
-rebuilds = 0
-upd4(INTERVAL); upd4(INTERVAL)
-check('turning it back on redraws, although nothing about the NPC changed', rebuilds > 0,
-      'addVfx calls=' .. rebuilds)
+runFor(1.01)
+check('turning it back on redraws within the off interval', stats.adds > 0, stats.adds)
+c.h.onInactive(); runFor(2)
 
 -- ---------------------------------------------------------------------------
 print('5. NPC range gate')
-cfg.npcRange = 3072; setCfg('npcRange', 3072)
-local adds, removes = 0, 0
-anim.addVfx    = function() adds = adds + 1 end
-anim.removeVfx = function() removes = removes + 1 end
-
--- A cell of distant NPCs loads: nobody builds.
+setCfg('npcRange', 3072)
 math.randomseed(99)
-local farActors, farUpd = {}, {}
-for i = 1, 40 do
-    farActors[i] = newActor(8000); guardInventory(farActors[i])
-    current = farActors[i]; farUpd[i] = common.makeUpdateHandler(farActors[i], nil)
-end
-adds = 0
-for _ = 1, math.floor(3 / DT) do
-    for i = 1, 40 do current = farActors[i]; farUpd[i](DT) end
-end
-check('40 NPCs beyond range build nothing at cell load', adds == 0, 'addVfx calls=' .. adds)
+stats.adds = 0
+local far = {}
+for i = 1, 40 do far[i] = spawn(8000) end
+local pFar = stats.polls
+runFor(6)
+check('40 NPCs beyond range build nothing at cell load', stats.adds == 0, stats.adds)
+check('far NPCs do no state reads at all (distance only)', stats.polls == pFar, stats.polls - pFar)
+for _, x in ipairs(far) do x.h.onInactive() end
+runFor(2)
 
--- Far-tier re-checks are spread, not all in one frame.
-local polls = {}
-for f = 1, math.floor(4 / DT) do
-    local before = stats.polls
-    for i = 1, 40 do current = farActors[i]; farUpd[i](DT) end
-    polls[f] = stats.polls - before
-end
-check('far NPCs do no state reads at all (distance only)', (function()
-    for _, n in ipairs(polls) do if n ~= 0 then return false end end
-    return true end)())
-
-local d = newActor(8000); guardInventory(d); current = d
-local upd5, act5 = common.makeUpdateHandler(d, nil)
-upd5(DT)
-adds = 0
-d.position = vec(1000, 0, 0)                 -- walks into range
-upd5(FAR)
-check('an NPC walking into range draws on its next far-tier check', adds > 0, 'addVfx calls=' .. adds)
-
-adds, removes = 0, 0
-d.position = vec(3300, 0, 0)                 -- beyond 3072, inside 3072*1.15
-upd5(INTERVAL); upd5(INTERVAL)
-check('inside the hysteresis band it stays drawn', removes == 0 and adds == 0,
-      ('add=%d remove=%d'):format(adds, removes))
-
-d.position = vec(3700, 0, 0)                 -- beyond the band
-upd5(INTERVAL)
-check('beyond the band it clears', removes > 0, 'removeVfx calls=' .. removes)
-
-adds = 0
-d.position = vec(3300, 0, 0)                 -- back into the band, from outside
-upd5(FAR)
-check('re-entering the band from outside does NOT redraw (must come within range)', adds == 0,
-      'addVfx calls=' .. adds)
+local d = spawn(8000)
+runFor(SPREAD + 0.01)
+stats.adds = 0
+d.position = vec(1000, 0, 0)
+runFor(FAR + 0.01)
+check('an NPC walking into range draws on its next far-tier check', stats.adds > 0, stats.adds)
+stats.adds, stats.removes = 0, 0
+d.position = vec(3300, 0, 0)
+runFor(2 * INTERVAL)
+check('inside the hysteresis band it stays drawn', stats.removes == 0 and stats.adds == 0,
+      ('add=%d remove=%d'):format(stats.adds, stats.removes))
+d.position = vec(3700, 0, 0)
+runFor(INTERVAL + 0.01)
+check('beyond the band it clears', stats.removes > 0, stats.removes)
+stats.adds = 0
+d.position = vec(3300, 0, 0)
+runFor(FAR + 0.01)
+check('re-entering the band from outside does NOT redraw', stats.adds == 0, stats.adds)
 d.position = vec(3000, 0, 0)
-upd5(FAR)
-check('within range it redraws', adds > 0, 'addVfx calls=' .. adds)
+runFor(FAR + 0.01)
+check('within range it redraws', stats.adds > 0, stats.adds)
+d.h.onInactive(); runFor(2)
 
 setCfg('npcRange', 0)
-local e = newActor(50000); guardInventory(e); current = e
-local upd6 = common.makeUpdateHandler(e, nil)
-adds = 0
-upd6(DT)
-check('npcRange = 0 means unlimited', adds > 0, 'addVfx calls=' .. adds)
-
-local pl = newActor(50000); guardInventory(pl); current = pl
+stats.adds = 0
+local e = spawn(50000)
+runFor(SPREAD + 0.01)
+check('npcRange = 0 means unlimited', stats.adds > 0, stats.adds)
+e.h.onInactive(); runFor(2)
 setCfg('npcRange', 3072)
-local updP = common.makeUpdateHandler(pl, true)
-adds = 0
-updP(DT)
-check('the player is never range-gated', adds > 0, 'addVfx calls=' .. adds)
 
 -- ---------------------------------------------------------------------------
-print('6. re-activation rebuilds although nothing changed')
-current = d
-d.position = vec(0, 0, 0)
-upd5(FAR); upd5(INTERVAL)
-adds = 0
-upd5(INTERVAL)
-check('steady: nothing rebuilt', adds == 0, 'addVfx calls=' .. adds)
-act5()
-upd5(DT)
-check('onActive forces a rebuild on the next frame', adds > 0, 'addVfx calls=' .. adds)
+print('6. the timer chain')
+local g = spawn(0)
+runFor(SPREAD + 2 * INTERVAL)
+stats.adds = 0
+current = g; g.h.onActive()
+runFor(SPREAD + 0.01)
+check('re-activation redraws although nothing changed', stats.adds > 0, stats.adds)
+
+current = g; g.h.onActive(); g.h.onLoad(); g.h.onActive()
+runFor(SPREAD + 0.01)
+local p6 = stats.polls
+runFor(10)
+check('repeated onActive / onLoad leave exactly one chain', stats.polls - p6 == 10, stats.polls - p6)
+
+g.h.onInactive()
+p6 = stats.polls
+runFor(10)
+check('onInactive retires the chain: no polls while inactive', stats.polls == p6, stats.polls - p6)
+check('and leaves no live timers behind', #timers == 0, #timers)
+
+current = g; g.h.onActive()
+runFor(SPREAD + 5 * INTERVAL)
+p6 = stats.polls
+runFor(10)
+check('re-activation restarts one chain', stats.polls - p6 == 10, stats.polls - p6)
+
+stats.errors = 0
+raiseNext = true
+runFor(INTERVAL + 0.01)
+check('a poll that raises re-raises (the engine logs it)', stats.errors == 1, stats.errors)
+p6 = stats.polls
+runFor(10)
+check('and the chain survives it', stats.polls - p6 >= 4, stats.polls - p6)
+g.h.onInactive(); runFor(2)
+
+-- ---------------------------------------------------------------------------
+print('7. a settings change no longer refreshes every NPC in one frame')
+math.randomseed(7)
+local crowd = {}
+for i = 1, 80 do crowd[i] = spawn(0) end
+runFor(SPREAD + 3 * INTERVAL)
+check('nothing subscribes to the settings section', #subs == 0, #subs)
+stats.refreshes = 0
+local refreshFrames = {}
+setCfg('categories', { axe = { secondary = true } })
+local DT = 1 / 60
+for _ = 1, math.floor((INTERVAL + 0.05) / DT) do
+    local r0 = stats.refreshes
+    advance(DT)
+    refreshFrames[#refreshFrames + 1] = stats.refreshes - r0
+end
+local rWorst = 0
+for _, r in ipairs(refreshFrames) do rWorst = math.max(rWorst, r) end
+print(string.format('     80 NPCs: %d refreshes within one interval, worst frame %d', stats.refreshes, rWorst))
+check('every NPC refreshes within one poll interval', stats.refreshes == 80, stats.refreshes)
+check('no frame refreshes more than a quarter of them', rWorst <= 20, rWorst)
+stats.refreshes = 0
+runFor(5)
+check('an unchanged version refreshes nothing', stats.refreshes == 0, stats.refreshes)
 
 print(fails == 0 and 'ALL PASS' or (fails .. ' FAILURES'))
+if fails > 0 then os.exit(1) end

@@ -1,16 +1,7 @@
----@omw-context menu|local|player
--- Weapon display categories: one per sheath bone, each with the bones each
--- layer uses. Pure data, no requires -- the MENU settings page and the local
--- scripts both read it, and openmw.types is not available in menu context.
 --
 --   std  the bone OpenMW's own weapon sheathing uses (first layer)
 --   alt  replacement for the first layer, from xbase_anim_ded2.nif ("Alt")
 --   ded  the second layer, from DedBones.nif ("Ded")
---
--- A layer with no bone in the shipped NIFs is nil, and the settings page
--- offers no checkbox for it. Verified against the NIFs: there is no
--- `Bip01 SpearTwoWideDed`, no `Bip01 AttachShieldAlt`, and no Ded or Alt ammo
--- bone at all.
 
 local M = {}
 
@@ -23,9 +14,6 @@ M.ORDER = {
 
 M.BY_ID = {
     shortBlade       = { std = "Bip01 ShortBladeOneHand",  alt = "Bip01 ShortBladeOneHandAlt",  ded = "Bip01 ShortBladeOneHandDed" },
-    -- One-hand axes share the standard long blade bone: the sheathing
-    -- skeleton's own `Bip01 AxeOneHand` is positioned for a very different
-    -- silhouette. Both extra sets give axes their own bone.
     longBlade        = { std = "Bip01 LongBladeOneHand",   alt = "Bip01 LongBladeOneHandAlt",   ded = "Bip01 LongBladeOneHandDed" },
     axe              = { std = "Bip01 LongBladeOneHand",   alt = "Bip01 AxeOneHandAlt",         ded = "Bip01 AxeOneHandDed" },
     longBladeTwoHand = { std = "Bip01 LongBladeTwoClose",  alt = "Bip01 LongBladeTwoCloseAlt",  ded = "Bip01 LongBladeTwoCloseDed" },

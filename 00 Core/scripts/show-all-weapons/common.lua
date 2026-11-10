@@ -36,16 +36,41 @@ local FAR_INTERVAL = 2.0
 -- Without it an NPC pacing on the boundary would rebuild on every check.
 local RANGE_HYSTERESIS = 1.15
 
+-- NPCs read their whole inventory on every FULL_SCAN_MULT-th poll (4 s at the
+-- defaults). The equipped weapon, the shield, the stance and the settings are
+-- read on every poll, because drawing or sheathing has to show at once; an
+-- NPC's inventory is near-static while you stand next to it.
+local FULL_SCAN_MULT = 4
+
+-- An NPC's first poll lands at a random point in this window after it becomes
+-- active, so a crowd activating together does not build in one frame (80 NPCs
+-- measured an 80 ms frame, 2026-11-08). The cost is gear appearing up to this
+-- long after a cell load.
+local ACTIVATE_SPREAD = 0.5
+
+-- With NPC display off, or the NPC filtered, it only re-checks the settings,
+-- at this interval.
+local OFF_INTERVAL = 1.0
+
 local cfg = storage.globalSection('DED_global')
 
--- Mirrored into plain locals and refreshed on change, rather than read live:
--- these are on the per-frame path for every actor running this handler.
+-- Mirrored into plain locals rather than read live: these are read on every
+-- poll of every actor.
 local cfgCache = { cats = {} }
 
--- Bumped on every settings change. The change detector pushes this single
--- number instead of every flag, so a settings change always rebuilds and an
+-- Bumped on every refresh. The change detector pushes this single number
+-- instead of every flag, so a settings change always rebuilds and an
 -- unchanged poll still compares one value.
 local cfgVersion = 0
+
+-- The storage 'version' the cache was built for. false = never built.
+--
+-- NOT cfg:subscribe. Every NPC runs its own copy of this module, so a
+-- module-level subscription made one settings change refresh every NPC's
+-- cache in the same frame: 80 NPCs measured a 52 ms frame (2026-11-08).
+-- global.lua bumps 'version' after writing a change, and each actor checks it
+-- on its own poll. The polls are staggered, so the refreshes are too.
+local cfgSeen = false
 
 local function refreshCfgCache()
     cfgCache.showNpcs = cfg:get('showNpcs') ~= false
@@ -85,18 +110,35 @@ local function refreshCfgCache()
         cfgCache.cats[id] = f
     end
 
-    -- NPC filters. getCopy for the same reason as above: these are tables.
-    local fl = cfg:getCopy('filters')
-    if type(fl) ~= 'table' then fl = {} end
-    cfgCache.classSet     = filters.buildClassSet(fl.classGroups, fl.classIds)
-    cfgCache.factionSet   = filters.buildFactionSet(fl.factionIds)
-    cfgCache.cellKeywords = filters.buildCellKeywords(fl.cellGroups, fl.cellIds)
+    -- The NPC filter sets are built on first use (filterSets), not here: the
+    -- player never filters, and a hidden or out-of-range NPC never asks.
+    cfgCache.filtersAt = nil
 
     cfgVersion = cfgVersion + 1
 end
 
-refreshCfgCache()
-cfg:subscribe(async:callback(refreshCfgCache))
+-- One storage read when nothing changed.
+local function ensureCfg()
+    local v = cfg:get('version') or 0
+    if v ~= cfgSeen then
+        cfgSeen = v
+        refreshCfgCache()
+    end
+end
+M.ensureCfg = ensureCfg
+
+-- NPC filters. getCopy for the same reason as categories: these are tables.
+local function filterSets()
+    if cfgCache.filtersAt ~= cfgVersion then
+        local fl = cfg:getCopy('filters')
+        if type(fl) ~= 'table' then fl = {} end
+        cfgCache.classSet     = filters.buildClassSet(fl.classGroups, fl.classIds)
+        cfgCache.factionSet   = filters.buildFactionSet(fl.factionIds)
+        cfgCache.cellKeywords = filters.buildCellKeywords(fl.cellGroups, fl.cellIds)
+        cfgCache.filtersAt    = cfgVersion
+    end
+    return cfgCache
+end
 
 ---Whether a category displays on this actor. The per-category NPC flag only
 ---narrows the main NPC toggle, which the update handler checks first.
@@ -291,17 +333,27 @@ local function newSnapshot()
     return snap
 end
 
--- Pushes everything a rebuild depends on. Keep this in step with handler():
--- if the rebuild starts reading something new, push it here too.
-local function pushState(snap, inv, equippedWeaponId, equippedShieldId, isDrawn, isPlayer)
+-- Two snapshots, each compared by position. Together they hold everything a
+-- rebuild depends on: keep them in step with handler(). If the rebuild starts
+-- reading something new, push it in one of these.
+
+-- The cheap tier, read on every poll.
+local function pushFast(snap, equippedWeaponId, equippedShieldId, isDrawn)
     snap.push(equippedWeaponId or false)
     snap.push(equippedShieldId or false)
     snap.push(isDrawn)
     snap.push(cfgVersion)
+end
 
+-- The inventory walk. `count` only for ammo: the rebuild dedupes weapons by
+-- recordId and fills shield slots from distinct records, so only a quiver's
+-- count can change what is drawn. The record lookup is the cache, a Lua table
+-- hit, not a crossing into the engine.
+local function pushInventory(snap, inv, isPlayer)
     for _, item in ipairs(inv:getAll(types.Weapon)) do
         snap.push(item.recordId)
-        snap.push(item.count)
+        local rec = weaponRecord(item)
+        if rec and AMMO_TYPES[rec.type] then snap.push(item.count) end
     end
     -- Separator that cannot collide with a recordId or a count, so a weapon
     -- list that shrinks by one while the shield list grows by one still
@@ -313,7 +365,6 @@ local function pushState(snap, inv, equippedWeaponId, equippedShieldId, isDrawn,
         for _, item in ipairs(inv:getAll(types.Armor)) do
             if isDisplayableShield(armorRecord(item)) then
                 snap.push(item.recordId)
-                snap.push(item.count)
             end
         end
     end
@@ -326,6 +377,7 @@ end
 ---@return boolean ready false when something should have been drawn and the
 ---skeleton had no bone for it
 local function handler(actor, equippedWeapon, equippedShield, isDrawn, isPlayer, inv)
+    ensureCfg()
     clearVfx(actor)
 
     local ready = true
@@ -502,7 +554,8 @@ end
 -- The faction whitelist overrides the class blacklist only, not the cell one.
 -- Called when settings change, on activation and on teleport -- never per poll.
 local function npcFiltered(actor)
-    local keywords = cfgCache.cellKeywords
+    local fs = filterSets()
+    local keywords = fs.cellKeywords
     if #keywords > 0 then
         local cell = actor.cell
         if cell and filters.cellMatches(keywords, cell.name, cell.id) then
@@ -510,139 +563,117 @@ local function npcFiltered(actor)
         end
     end
 
-    if next(cfgCache.classSet) == nil then return false end
+    if next(fs.classSet) == nil then return false end
     local rec = types.NPC.record(actor)
     local class = rec and filters.normalize(rec.class)
-    if not class or not cfgCache.classSet[class] then return false end
+    if not class or not fs.classSet[class] then return false end
 
-    if next(cfgCache.factionSet) ~= nil then
+    if next(fs.factionSet) ~= nil then
         for _, factionId in pairs(types.NPC.getFactions(actor)) do
             local id = filters.normalize(factionId)
-            if id and cfgCache.factionSet[id] then return false end
+            if id and fs.factionSet[id] then return false end
         end
     end
     return true
 end
 
 -- ---------------------------------------------------------------------------
--- UPDATE HANDLER
+-- POLLER
 -- ---------------------------------------------------------------------------
+-- What one actor does on a poll. The player drives it from onUpdate (one
+-- script); NPCs drive it from a timer chain (makeNpcDriver).
 
----@param actor any
----@param isPlayer boolean|nil true for the player script; NPC scripts pass nil
----@return function onUpdate
----@return function onActive
-function M.makeUpdateHandler(actor, isPlayer)
-    local inv          = types.Actor.inventory(actor)
-    local timer        = 0
-    local snap         = newSnapshot()
-    local hidden       = false   -- false | 'toggle' | 'filter' | 'range'
-    local filtered     = false   -- cached npcFiltered() answer (NPCs only)
-    local filterAt     = -1      -- cfgVersion it was computed for; -1 = stale
-    local forceRebuild = true    -- first pass always builds
+local function makePoller(actor, isPlayer)
+    -- A live view: it reflects later additions by itself, so resolve it once.
+    local inv      = types.Actor.inventory(actor)
+    local fast     = newSnapshot()
+    local walk     = newSnapshot()
+    local walkIn   = 0       -- polls until the next inventory walk; 0 = next poll
+    local hidden   = false   -- false | 'toggle' | 'filter' | 'range'
+    local filtered = false   -- cached npcFiltered() answer (NPCs only)
+    local filterAt = -1      -- cfgVersion it was computed for; -1 = stale
+
+    local P = {}
+
+    -- Forget what was drawn, so the next poll walks and rebuilds.
+    function P.invalidate()
+        fast.invalidate()
+        walk.invalidate()
+        walkIn = 0
+    end
 
     ---@return boolean changed, any w, any s, boolean drawn
-    local function takeSnapshot()
+    local function takeSnapshot(doWalk)
         local w, s, drawn = readState(actor)
-        snap.begin()
-        pushState(snap, inv, w and w.recordId, s and s.recordId, drawn, isPlayer)
-        return snap.finish(), w, s, drawn
+        fast.begin()
+        pushFast(fast, w and w.recordId, s and s.recordId, drawn)
+        local changed = fast.finish()
+        if doWalk then
+            walk.begin()
+            pushInventory(walk, inv, isPlayer)
+            if walk.finish() then changed = true end
+        end
+        return changed, w, s, drawn
     end
 
     ---@return boolean ready
-    local function rebuildNow()
-        local _, w, s, drawn = takeSnapshot()
-        local ready = handler(actor, w, s, drawn, isPlayer, inv)
-        forceRebuild = false
-        return ready
+    function P.rebuildNow()
+        ensureCfg()
+        local _, w, s, drawn = takeSnapshot(true)
+        return handler(actor, w, s, drawn, isPlayer, inv)
     end
 
     -- Clear once, and make the next poll that is allowed to draw see a change.
     local function hide(reason)
         if not hidden then
             clearVfx(actor)
-            snap.invalidate()
+            P.invalidate()
         end
         hidden = reason
     end
 
-    if I.AnimRefresh and I.AnimRefresh.subscribe then
-        I.AnimRefresh.subscribe("InventoryEquipmentDisplay", function()
-            local ready = rebuildNow()
-            if not ready then return false end
-        end, { verify = true })
-    end
-
-    local function onUpdate(dt)
-        -- FIRST, before the timer: with NPC display off this boolean is the
-        -- entire per-frame cost on every NPC.
-        if not isPlayer and not cfgCache.showNpcs then
-            hide('toggle')
-            forceRebuild = false
-            return
-        end
-
-        -- Filters next: settings-, activation- and teleport-driven, so the
-        -- steady-state cost is one integer compare.
+    ---One poll.
+    ---@return number delay until the next poll, seconds
+    function P.service()
+        ensureCfg()
         if not isPlayer then
+            if not cfgCache.showNpcs then
+                hide('toggle')
+                return OFF_INTERVAL
+            end
+            -- Settings-, activation- and teleport-driven, so the steady-state
+            -- cost is one integer compare.
             if filterAt ~= cfgVersion then
                 filtered = npcFiltered(actor)
                 filterAt = cfgVersion
             end
             if filtered then
                 hide('filter')
-                forceRebuild = false
-                return
+                return OFF_INTERVAL
             end
-        end
-
-        -- Toggled or unfiltered back on: redraw now, not one far-tier
-        -- interval later.
-        if hidden == 'toggle' or hidden == 'filter' then
-            hidden = false
-            forceRebuild = true
-        end
-
-        timer = timer + (dt or 0)
-        local interval
-        if isPlayer then
-            interval = pollInterval(true)
-        elseif hidden == 'range' then
-            interval = FAR_INTERVAL
-        else
-            interval = pollInterval(false)
-        end
-        if timer < interval and not forceRebuild then return end
-
-        local wasForced = forceRebuild
-        forceRebuild = false
-
-        -- The range gate runs BEFORE the first build too, so a cell full of
-        -- distant NPCs pays nothing at load beyond one distance check each.
-        if not isPlayer and not withinRange(actor, not hidden) then
-            hide('range')
-            -- Random phase for the far tier as well, so a crowd leaving range
-            -- together does not re-check in the same frame forever.
-            timer = wasForced and math.random() * FAR_INTERVAL or 0
-            return
+            -- The range gate runs before the first build too, so a cell full
+            -- of distant NPCs pays one distance check each.
+            if not withinRange(actor, not hidden) then
+                hide('range')
+                return FAR_INTERVAL
+            end
         end
         hidden = false
 
-        if wasForced then
-            rebuildNow()
-            -- Random phase, set once. Every NPC in a cell is activated in the
-            -- same frame, so a shared timer = 0 put all of them on the same
-            -- poll frame, every interval, forever. The first build itself
-            -- stays immediate so gear never pops in late.
-            timer = math.random() * interval
-            return
+        local doWalk = isPlayer or walkIn <= 0
+        if doWalk then walkIn = FULL_SCAN_MULT - 1 else walkIn = walkIn - 1 end
+
+        local changed, w, s, drawn = takeSnapshot(doWalk)
+        if changed then
+            -- A change on the cheap tier between walks: walk now as well, so
+            -- the rebuild and the walk snapshot agree.
+            if not doWalk then
+                walk.begin(); pushInventory(walk, inv, isPlayer); walk.finish()
+                walkIn = FULL_SCAN_MULT - 1
+            end
+            handler(actor, w, s, drawn, isPlayer, inv)
         end
-        timer = 0
-
-        local changed, w, s, drawn = takeSnapshot()
-        if not changed then return end
-
-        handler(actor, w, s, drawn, isPlayer, inv)
+        return pollInterval(isPlayer)
     end
 
     -- An actor leaving the active grid loses its animation object, and with it
@@ -651,20 +682,100 @@ function M.makeUpdateHandler(actor, isPlayer)
     -- compares equal and the gear stays missing until something moves.
     -- activeTags is deliberately kept: rebuild's clearVfx removes those ids,
     -- a no-op if the engine already dropped them, and a real cleanup if not.
-    local function onActive()
-        snap.invalidate()
-        hidden       = false
-        forceRebuild = true
-        filterAt     = -1
+    function P.onActive()
+        P.invalidate()
+        hidden   = false
+        filterAt = -1
     end
 
     -- A teleport can move an NPC into or out of a blacklisted cell (a
     -- follower entering a temple with the player). Re-judge on arrival.
-    local function onTeleported()
+    function P.onTeleported()
         filterAt = -1
     end
 
-    return onUpdate, onActive, onTeleported
+    return P
+end
+
+-- ---------------------------------------------------------------------------
+-- PLAYER: onUpdate
+-- ---------------------------------------------------------------------------
+-- One script, so a per-frame handler costs one call a frame, and keeps the
+-- player's poll on the frame clock. The player is never range-gated or
+-- filtered and walks its inventory on every poll: picking up a sword shows
+-- within one interval.
+
+---@param actor any
+---@param isPlayer boolean|nil must be true; NPCs use makeNpcDriver
+---@return function onUpdate
+function M.makeUpdateHandler(actor, isPlayer)
+    assert(isPlayer, 'makeUpdateHandler is the player path; NPCs use makeNpcDriver')
+    local P     = makePoller(actor, true)
+    local timer = 0
+    local delay = 0          -- 0: the first frame polls
+
+    if I.AnimRefresh and I.AnimRefresh.subscribe then
+        I.AnimRefresh.subscribe("InventoryEquipmentDisplay", function()
+            local ready = P.rebuildNow()
+            if not ready then return false end
+        end, { verify = true })
+    end
+
+    return function(dt)
+        timer = timer + (dt or 0)
+        if timer < delay then return end
+        timer = 0
+        delay = P.service()
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- NPCs: a timer chain, no onUpdate
+-- ---------------------------------------------------------------------------
+-- The engine calls an onUpdate on every active script every frame. A
+-- per-frame handler that returns early 59 frames in 60 still cost 2-4 us per
+-- NPC per frame in game (2026-11-08), most of DED's steady cost. Each poll
+-- instead arms the next one, and an idle NPC costs nothing in between.
+--
+-- What has to be right:
+--   * a generation counter, so a restart cannot leave two chains on one actor;
+--   * onInactive retires the chain: an inactive script's timers do not fire,
+--     but their due times pass, so a cell's worth would fire together on return;
+--   * onLoad re-arms, because a save load drops unsavable timers;
+--   * a poll that raises must still arm its successor, or that NPC's display
+--     is frozen for the session. The guard re-arms and re-raises unchanged.
+
+---@param actor any
+---@return table handlers onActive, onInactive, onLoad, onTeleported
+function M.makeNpcDriver(actor)
+    local P   = makePoller(actor, false)
+    local gen = 0
+
+    -- One callback per chain, re-armed with itself: a poll allocates no
+    -- closure. A chain whose generation is stale stops at its next firing.
+    local function newChain(g)
+        local tick
+        tick = function()
+            if g ~= gen then return end
+            local ok, res = pcall(P.service)
+            async:newUnsavableSimulationTimer(ok and res or FAR_INTERVAL, tick)
+            if not ok then error(res, 0) end
+        end
+        return tick
+    end
+
+    local function start()
+        gen = gen + 1
+        P.onActive()
+        async:newUnsavableSimulationTimer(math.random() * ACTIVATE_SPREAD, newChain(gen))
+    end
+
+    return {
+        onActive     = start,
+        onLoad       = start,
+        onInactive   = function() gen = gen + 1 end,
+        onTeleported = P.onTeleported,
+    }
 end
 
 M.handler = handler
