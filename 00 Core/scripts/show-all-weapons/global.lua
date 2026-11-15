@@ -37,6 +37,11 @@ return {
             for key in pairs(DEFAULTS) do
                 if data[key] ~= nil then state:set(key, data[key]) end
             end
+            -- Last, after every value is written: actors compare this one
+            -- number on their own polls and refresh their caches then.
+            -- Nothing subscribes to the section, so the writes above fan out
+            -- to no one.
+            state:set('version', (state:get('version') or 0) + 1)
         end,
     },
 }

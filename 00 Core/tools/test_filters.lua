@@ -100,110 +100,134 @@ package.preload['openmw.animation'] = function() return {
     addVfx = function() stats.adds = stats.adds + 1 end,
     removeVfx = function() stats.removes = stats.removes + 1 end,
 } end
-local cfg, cfgSubs = { showNpcs = true, npcRange = 0 }, {}
+-- Settings arrive the way global.lua delivers them: values, then 'version'.
+local cfg = { showNpcs = true, npcRange = 0, version = 1 }
 local function setFilters(f)
     cfg.filters = f
-    for _, cb in ipairs(cfgSubs) do cb('DED_global', 'filters') end
+    cfg.version = cfg.version + 1
 end
 package.preload['openmw.storage'] = function() return {
     globalSection = function()
-        return dofile('tools/mock_storage.lua').section(function() return cfg end, cfgSubs)
+        return dofile('tools/mock_storage.lua').section(function() return cfg end, nil)
     end,
 } end
+-- A simulated simulation clock; timers remember whose script armed them.
+local now, timers = 0, {}
 package.preload['openmw.async'] = function() return {
     callback = function(_, f) return f end,
-    newUnsavableSimulationTimer = function(_, _, f) f() end,
+    newUnsavableSimulationTimer = function(_, d, f) timers[#timers + 1] = { at = now + d, fn = f, actor = current } end,
 } end
+local function advance(dt)
+    local target = now + dt
+    while true do
+        local bi
+        for i, t in ipairs(timers) do
+            if t.at <= target and (not bi or t.at < timers[bi].at) then bi = i end
+        end
+        if not bi then break end
+        local t = table.remove(timers, bi)
+        now = math.max(now, t.at); current = t.actor; t.fn()
+    end
+    now = target
+end
 package.preload['openmw.interfaces'] = function() return {} end
 package.preload['openmw.nearby'] = function() return { players = { player } } end
 package.preload['scripts.show-all-weapons.categories'] = function() return dofile(DIR .. 'categories.lua') end
 package.preload['scripts.show-all-weapons.bones'] = function() return dofile(DIR .. 'bones.lua') end
-local common = dofile(DIR .. 'common.lua')
 
-local DT, POLL = 1 / 60, 1.0
+local DT = 1 / 60
+local SETTLE, POLL = 0.51, 1.01      -- ACTIVATE_SPREAD; one NPC poll
+-- Each NPC runs its own copy of common.lua, as in game. Retire the previous
+-- NPC so only the one under test polls.
+local last
 local function npc(class, factions, cell)
+    if last then last.h.onInactive() end
     local a = newNpc(class, factions, cell)
     current = a
-    local upd, act, tel = common.makeUpdateHandler(a, nil)
-    return a, function(dt) current = a; upd(dt) end, act, tel
+    a.h = dofile(DIR .. 'common.lua').makeNpcDriver(a)
+    a.h.onActive()
+    last = a
+    return a
 end
 
 print('class blacklist')
 setFilters(nil)
 stats.adds = 0
-local _, u1 = npc('commoner')
-u1(DT)
+npc('commoner')
+advance(SETTLE)
 check('no filters: an NPC shows its gear', stats.adds > 0, stats.adds)
 
 setFilters({ classGroups = { commoner = true } })
 stats.adds, stats.removes = 0, 0
-u1(DT)
-check('blacklisting its class group clears it on the next frame', stats.removes > 0 and stats.adds == 0,
+advance(POLL)
+check('blacklisting its class group clears it on the next poll', stats.removes > 0 and stats.adds == 0,
       ('add=%d remove=%d'):format(stats.adds, stats.removes))
 
 stats.adds = 0
-local _, u2 = npc('pauper')
-u2(DT); u2(POLL)
+npc('pauper')
+advance(SETTLE + POLL)
 check('a blacklisted NPC entering the scene builds nothing', stats.adds == 0, stats.adds)
 
 stats.adds = 0
-local _, u3 = npc('guard')
-u3(DT)
+npc('guard')
+advance(SETTLE)
 check('other classes are unaffected', stats.adds > 0)
 
 setFilters({ classIds = { guard = true } })
 stats.adds = 0
-u3(DT); u3(POLL)
+npc('guard')
+advance(SETTLE + POLL)
 check('a typed class id blacklists', stats.adds == 0)
 
 print('faction whitelist')
 setFilters({ classGroups = { commoner = true }, factionIds = { ['imperial legion'] = true } })
 stats.adds = 0
-local _, u4 = npc('commoner', { 'east empire company' })
-u4(DT)
+npc('commoner', { 'east empire company' })
+advance(SETTLE)
 check('a blacklisted class in a whitelisted family still shows', stats.adds > 0, stats.adds)
 stats.adds = 0
-local _, u5 = npc('commoner', { 'mages guild' })
-u5(DT)
+npc('commoner', { 'mages guild' })
+advance(SETTLE)
 check('a blacklisted class in another faction stays hidden', stats.adds == 0, stats.adds)
 
 print('cell blacklist')
 setFilters({ cellGroups = { holyGround = true }, factionIds = { temple = true } })
 stats.adds = 0
-local _, u6 = npc('priest', { 'temple' }, 'Vivec, High Fane')
-u6(DT)
+npc('priest', { 'temple' }, 'Vivec, High Fane')
+advance(SETTLE)
 check('the cell blacklist wins over the faction whitelist', stats.adds == 0, stats.adds)
 
 stats.adds = 0
-local a7, u7, _, tel7 = npc('warrior', {}, 'Balmora')
-u7(DT)
+local a7 = npc('warrior', {}, 'Balmora')
+advance(SETTLE)
 check('outside a blacklisted cell it shows', stats.adds > 0)
 a7.cell = { name = 'Balmora, Temple', id = 'Balmora, Temple' }
 stats.removes = 0
-u7(POLL)
+advance(POLL)
 check('walking in does NOT re-judge by itself (no per-poll cell reads)', stats.removes == 0)
-tel7()
-u7(DT)
-check('a teleport into a blacklisted cell re-judges and clears', stats.removes > 0, stats.removes)
+a7.h.onTeleported()
+advance(POLL)
+check('a teleport into a blacklisted cell re-judges and clears on the next poll', stats.removes > 0, stats.removes)
 
 print('cost and recovery')
 setFilters({ classGroups = { commoner = true } })
-local _, u8 = npc('commoner')
-u8(DT)
+npc('commoner')
+advance(SETTLE)
 local r0, s0 = stats.records, stats.reads
-for _ = 1, 600 do u8(DT) end
-check('a filtered NPC does no record or state reads per frame',
+advance(10)
+check('a filtered NPC does no record or state reads while filtered',
       stats.records == r0 and stats.reads == s0,
       ('records +%d, reads +%d'):format(stats.records - r0, stats.reads - s0))
 
 stats.adds = 0
 setFilters(nil)
-u8(DT)
-check('clearing the filter redraws on the next frame', stats.adds > 0, stats.adds)
+advance(POLL)
+check('clearing the filter redraws within one off interval', stats.adds > 0, stats.adds)
 
+if last then last.h.onInactive() end
 local pl = newNpc('commoner', {}, 'Vivec, Temple'); current = pl
 setFilters({ classGroups = { commoner = true }, cellGroups = { holyGround = true } })
-local updP = common.makeUpdateHandler(pl, true)
+local updP = dofile(DIR .. 'common.lua').makeUpdateHandler(pl, true)
 stats.adds = 0
 updP(DT)
 check('the player is never filtered', stats.adds > 0)
